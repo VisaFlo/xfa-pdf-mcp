@@ -51,6 +51,7 @@ class OpenDocument:
     data_node: Any
     template_ns: str
     template_root: Any
+    template_index: int = -1  # index in XFA array for template stream
     field_meta: dict[str, FieldMeta] = field(default_factory=dict)
     lov_data: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
     repeating_sections: list[RepeatingSection] = field(default_factory=list)
@@ -102,6 +103,7 @@ class XfaPdfEngine:
         datasets_root = None
         template_root = None
         template_ns = None
+        template_index = None
 
         for i in range(0, len(xfa), 2):
             key = str(xfa[i])
@@ -110,6 +112,7 @@ class XfaPdfEngine:
                 xml_bytes = bytes(xfa[i + 1].read_bytes())
                 datasets_root = etree.fromstring(xml_bytes)
             elif key == "template":
+                template_index = i + 1
                 tmpl_bytes = bytes(xfa[i + 1].read_bytes())
                 template_root = etree.fromstring(tmpl_bytes)
                 root_ns = template_root.tag.split("}")[0].lstrip("{") if "}" in template_root.tag else ""
@@ -140,6 +143,7 @@ class XfaPdfEngine:
             data_node=data_node,
             template_ns=detected_ns,
             template_root=template_root,
+            template_index=template_index or -1,
         )
         # Extract LOV (List of Values) from datasets for dropdown lookups
         doc.lov_data = self._extract_lov(datasets_root)
@@ -810,15 +814,71 @@ class XfaPdfEngine:
             if kids:
                 self._strip_signature_fields(kids)
 
+    def _sync_template_presence(self, doc: OpenDocument) -> None:
+        """Update template subform presence attributes based on data values.
+
+        Adobe Reader uses presence attributes to show/hide subforms. Since we
+        don't run JavaScript, we must set these based on the filled data.
+        """
+        ns_t = doc.template_ns
+
+        # Find all Phone/AltPhone/FaxEmail Phone subforms with CanadaUS/Other data
+        for subform in doc.template_root.iter(f"{{{ns_t}}}subform"):
+            sf_name = subform.get("name", "")
+            if sf_name not in ("Phone", "AltPhone"):
+                continue
+
+            # Build the data path for this subform
+            path_parts = []
+            parent = subform.getparent()
+            while parent is not None:
+                pname = parent.get("name", "")
+                if pname:
+                    path_parts.insert(0, pname)
+                parent = parent.getparent()
+            data_path = "/".join(path_parts) + "/" + sf_name
+
+            # Check CanadaUS value in data
+            canada_us = self._get_value_at_path(doc, data_path + "/CanadaUS")
+
+            # Find NANumber and IntlNumber child subforms
+            for child_sf in subform:
+                if not isinstance(child_sf.tag, str):
+                    continue  # skip ProcessingInstructions, Comments
+                child_tag = etree.QName(child_sf.tag).localname if "}" in child_sf.tag else child_sf.tag
+                if child_tag != "subform":
+                    continue
+                child_name = child_sf.get("name", "")
+                if child_name == "NANumber":
+                    if canada_us == "1":
+                        child_sf.set("presence", "visible")
+                    elif canada_us == "0":
+                        child_sf.set("presence", "invisible")
+                elif child_name == "IntlNumber":
+                    if canada_us == "1":
+                        child_sf.set("presence", "invisible")
+                    elif canada_us == "0":
+                        child_sf.set("presence", "visible")
+
     def _prepare_for_save(self, doc: OpenDocument) -> None:
         """Serialize modified datasets XML back into the PDF and strip signatures.
 
         Shared logic used by both save() and save_bytes().
         """
+        # Sync template presence attributes based on filled data
+        self._sync_template_presence(doc)
+
         modified_xml = etree.tostring(
             doc.datasets_root, xml_declaration=False, encoding="unicode"
         ).encode("utf-8")
         doc.xfa_array[doc.datasets_index].write(modified_xml)
+
+        # Write modified template back if we changed presence attributes
+        if doc.template_index >= 0:
+            template_xml = etree.tostring(
+                doc.template_root, xml_declaration=False, encoding="unicode"
+            ).encode("utf-8")
+            doc.xfa_array[doc.template_index].write(template_xml)
 
         # Remove all certification/signature data to avoid
         # "certification is invalid" warnings in Adobe Reader.
