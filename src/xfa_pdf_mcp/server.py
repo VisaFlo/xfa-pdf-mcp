@@ -123,6 +123,38 @@ def close_pdf(doc_id: str) -> dict:
     return {"message": f"Document {doc_id} closed."}
 
 
+@mcp.tool()
+def list_repeating_sections(doc_id: str) -> list[dict]:
+    """List all repeating sections (dynamic rows) in the form.
+
+    These are sections where rows can be dynamically added, like
+    dependants, children, employment history, travel history, etc.
+
+    Args:
+        doc_id: Document ID from open_pdf.
+
+    Returns:
+        List of repeating sections with path, name, max rows, current count, and field names.
+    """
+    return engine.list_repeating_sections(doc_id)
+
+
+@mcp.tool()
+def add_row(doc_id: str, section_path: str, field_values: dict[str, str]) -> dict:
+    """Add a new row to a repeating section (e.g. add a dependant, child, employment entry).
+
+    Args:
+        doc_id: Document ID from open_pdf.
+        section_path: Path from list_repeating_sections (e.g. "form1/Page1/dependants").
+        field_values: Dict mapping field names to values. Use just the field name,
+            not the full path. Example: {"FamilyName": "SMITH", "GivenName": "JOHN"}
+
+    Returns:
+        Row index and resolved values.
+    """
+    return engine.add_row(doc_id, section_path, field_values)
+
+
 def main():
     mcp.run()
 

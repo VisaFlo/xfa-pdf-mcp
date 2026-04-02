@@ -29,6 +29,16 @@ class FieldMeta:
 
 
 @dataclass
+class RepeatingSection:
+    """Metadata for a repeating subform in the template."""
+    path: str  # template path e.g. "form1/Page1/dependants"
+    data_name: str  # the subform name used in datasets e.g. "dependants"
+    parent_data_path: str  # parent path in datasets e.g. "form1/Page1"
+    max_occur: int  # -1 = unlimited
+    field_names: list[str]  # field names within the subform
+
+
+@dataclass
 class OpenDocument:
     """Represents an open XFA-PDF in memory."""
     pdf: pikepdf.Pdf
@@ -40,7 +50,8 @@ class OpenDocument:
     template_ns: str
     template_root: Any
     field_meta: dict[str, FieldMeta] = field(default_factory=dict)
-    lov_data: dict[str, list[tuple[str, str]]] = field(default_factory=dict)  # LOV name -> [(code, label), ...]
+    lov_data: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+    repeating_sections: list[RepeatingSection] = field(default_factory=list)
 
 
 class XfaPdfEngine:
@@ -115,8 +126,54 @@ class XfaPdfEngine:
         doc.lov_data = self._extract_lov(datasets_root)
         # Build field metadata cache from template
         doc.field_meta = self._build_field_meta(template_root, detected_ns, doc.lov_data)
+        # Extract repeating section definitions from template
+        doc.repeating_sections = self._extract_repeating_sections(template_root, detected_ns)
         self.documents[doc_id] = doc
         return doc_id
+
+    def _extract_repeating_sections(self, template_root, ns_t: str) -> list[RepeatingSection]:
+        """Find all repeating subforms (max > 1 or max = -1) in the template."""
+        sections = []
+        for subform in template_root.iter(f"{{{ns_t}}}subform"):
+            occur = subform.find(f"{{{ns_t}}}occur")
+            if occur is None:
+                continue
+            max_val = occur.get("max", "1")
+            if max_val in ("0", "1", ""):
+                continue
+
+            name = subform.get("name", "")
+            if not name:
+                continue
+
+            max_int = int(max_val) if max_val != "-1" else -1
+
+            # Build path
+            path_parts = []
+            parent = subform.getparent()
+            while parent is not None:
+                pname = parent.get("name", "")
+                if pname:
+                    path_parts.insert(0, pname)
+                parent = parent.getparent()
+            full_path = "/".join(path_parts) + "/" + name
+            parent_path = "/".join(path_parts)
+
+            # Get field names within this subform
+            field_names = []
+            for f in subform.findall(f".//{{{ns_t}}}field"):
+                fname = f.get("name", "")
+                if fname and fname not in ("RemoveButton", "AddButton"):
+                    field_names.append(fname)
+
+            sections.append(RepeatingSection(
+                path=full_path,
+                data_name=name,
+                parent_data_path=parent_path,
+                max_occur=max_int,
+                field_names=field_names,
+            ))
+        return sections
 
     def _extract_lov(self, datasets_root) -> dict[str, list[tuple[str, str]]]:
         """Extract LOV (List of Values) data from datasets XML.
@@ -506,6 +563,104 @@ class XfaPdfEngine:
             resolved = self._normalize_date(doc, path, resolved)
             results[path] = self._set_value_at_path(doc, path, resolved)
         return results
+
+    def list_repeating_sections(self, doc_id: str) -> list[dict]:
+        """List all repeating sections (dynamic rows) in the form."""
+        doc = self._get_doc(doc_id)
+        result = []
+        for rs in doc.repeating_sections:
+            # Count existing data rows
+            existing = self._count_data_rows(doc, rs)
+            result.append({
+                "path": rs.path,
+                "name": rs.data_name,
+                "parent_path": rs.parent_data_path,
+                "max": rs.max_occur,
+                "current_count": existing,
+                "field_names": rs.field_names,
+            })
+        return result
+
+    def _count_data_rows(self, doc: OpenDocument, rs: RepeatingSection) -> int:
+        """Count existing data nodes for a repeating section."""
+        parent = self._navigate_to_path(doc, rs.parent_data_path)
+        if parent is None:
+            return 0
+        count = 0
+        for child in parent:
+            tag = etree.QName(child.tag).localname if "}" in child.tag else child.tag
+            if tag == rs.data_name:
+                count += 1
+        return count
+
+    def _navigate_to_path(self, doc: OpenDocument, path: str):
+        """Navigate the data XML tree to a path, returning the element."""
+        parts = path.split("/")
+        node = doc.data_node
+        for part in parts:
+            found = None
+            for child in node:
+                tag = etree.QName(child.tag).localname if "}" in child.tag else child.tag
+                if tag == part:
+                    found = child
+                    break
+            if found is None:
+                return None
+            node = found
+        return node
+
+    def add_row(self, doc_id: str, section_path: str, field_values: dict[str, str]) -> dict:
+        """Add a new row to a repeating section.
+
+        Args:
+            doc_id: Document ID.
+            section_path: Path of the repeating section (from list_repeating_sections).
+            field_values: Dict mapping field names to values (just the field name,
+                         not the full path — e.g. {"FamilyName": "SMITH"}).
+
+        Returns:
+            Dict with row index and resolved values.
+        """
+        doc = self._get_doc(doc_id)
+
+        # Find the matching repeating section
+        rs = None
+        for s in doc.repeating_sections:
+            if s.path == section_path:
+                rs = s
+                break
+        if rs is None:
+            raise ValueError(f"Repeating section not found: {section_path}")
+
+        # Check max
+        current = self._count_data_rows(doc, rs)
+        if rs.max_occur != -1 and current >= rs.max_occur:
+            raise ValueError(f"Cannot add row: max {rs.max_occur} reached ({current} existing)")
+
+        # Navigate to parent
+        parent = self._navigate_to_path(doc, rs.parent_data_path)
+        if parent is None:
+            raise ValueError(f"Parent path not found in datasets: {rs.parent_data_path}")
+
+        # Create new data node
+        new_row = etree.SubElement(parent, rs.data_name)
+
+        # Fill field values, applying the same resolvers
+        resolved = {}
+        for field_name, value in field_values.items():
+            # Build a pseudo full path for resolver lookup
+            full_path = f"{section_path}/{field_name}"
+            val = self._resolve_checkbox_value(doc, full_path, value)
+            val = self._resolve_choicelist_value(doc, full_path, val)
+            val = self._normalize_date(doc, full_path, val)
+            etree.SubElement(new_row, field_name).text = val
+            resolved[field_name] = val
+
+        return {
+            "row_index": current,
+            "section": section_path,
+            "values": resolved,
+        }
 
     def _strip_signature_fields(self, fields) -> None:
         """Recursively remove /V from signature fields."""
