@@ -22,7 +22,8 @@ class FieldMeta:
     """Metadata for a single form field, extracted from the template."""
     path: str
     field_type: str
-    items: list[str]  # for checkButton: [on_value] or [on, off, neutral]; for choiceList: option values
+    items: list[str]  # for checkButton: [on_value] or [on, off, neutral]
+    options: list[tuple[str, str]] = field(default_factory=list)  # for choiceList: [(code, label), ...]
 
 
 @dataclass
@@ -37,6 +38,7 @@ class OpenDocument:
     template_ns: str
     template_root: Any
     field_meta: dict[str, FieldMeta] = field(default_factory=dict)
+    lov_data: dict[str, list[tuple[str, str]]] = field(default_factory=dict)  # LOV name -> [(code, label), ...]
 
 
 class XfaPdfEngine:
@@ -107,12 +109,39 @@ class XfaPdfEngine:
             template_ns=detected_ns,
             template_root=template_root,
         )
+        # Extract LOV (List of Values) from datasets for dropdown lookups
+        doc.lov_data = self._extract_lov(datasets_root)
         # Build field metadata cache from template
-        doc.field_meta = self._build_field_meta(template_root, detected_ns)
+        doc.field_meta = self._build_field_meta(template_root, detected_ns, doc.lov_data)
         self.documents[doc_id] = doc
         return doc_id
 
-    def _build_field_meta(self, template_root, ns_t: str) -> dict[str, FieldMeta]:
+    def _extract_lov(self, datasets_root) -> dict[str, list[tuple[str, str]]]:
+        """Extract LOV (List of Values) data from datasets XML.
+
+        Returns dict mapping LOV list name to [(code, label), ...] pairs.
+        """
+        lov_data = {}
+        lov_file = datasets_root.find("LOVFile")
+        if lov_file is None:
+            return lov_data
+        lov_elem = lov_file.find("LOV")
+        if lov_elem is None:
+            return lov_data
+
+        for lov_list in lov_elem:
+            list_name = lov_list.tag
+            options = []
+            for item in lov_list:
+                code = item.get("lic", "")
+                label = item.text or ""
+                if code:  # skip empty entries
+                    options.append((code, label))
+            if options:
+                lov_data[list_name] = options
+        return lov_data
+
+    def _build_field_meta(self, template_root, ns_t: str, lov_data: dict) -> dict[str, FieldMeta]:
         """Extract field metadata (type, items/options) from the XFA template."""
         meta = {}
         for field_elem in template_root.iter(f"{{{ns_t}}}field"):
@@ -136,19 +165,83 @@ class XfaPdfEngine:
                     field_type = etree.QName(child.tag).localname
                     break
 
-            # Extract items (checkbox on/off values, choiceList options)
+            # Extract items for checkButtons
             items = []
-            for items_elem in field_elem.findall(f"{{{ns_t}}}items"):
-                for item in items_elem:
-                    if item.text:
-                        items.append(item.text)
+            # Extract options for choiceLists
+            options = []
+
+            items_elems = field_elem.findall(f"{{{ns_t}}}items")
+
+            if field_type == "checkButton":
+                for items_elem in items_elems:
+                    for item in items_elem:
+                        if item.text:
+                            items.append(item.text)
+            elif field_type == "choiceList":
+                # choiceList can have inline items or be LOV-driven
+                labels = []
+                codes = []
+                for items_elem in items_elems:
+                    save = items_elem.get("save", "")
+                    item_texts = [item.text or "" for item in items_elem]
+                    if save == "1":
+                        codes = item_texts  # save=1 items are the stored codes
+                    else:
+                        labels = item_texts  # display labels
+
+                if codes and labels and len(codes) == len(labels):
+                    # Inline items with both labels and codes
+                    options = list(zip(codes, labels))
+                elif not codes and not labels:
+                    # LOV-driven — try to match field name to a LOV list
+                    options = self._match_lov(name, lov_data)
 
             meta[full_path] = FieldMeta(
                 path=full_path,
                 field_type=field_type,
                 items=items,
+                options=options,
             )
         return meta
+
+    def _match_lov(self, field_name: str, lov_data: dict) -> list[tuple[str, str]]:
+        """Try to match a choiceList field name to a LOV list by convention.
+
+        IRCC forms use naming conventions like:
+        - Field "Country" -> LOV "CountryList"
+        - Field "PlaceBirthCountry" -> LOV "CountryOfBirthList"
+        - Field "Citizenship" -> LOV "CountryOfCitizenshipList"
+        - Field "MaritalStatus" -> LOV "MaritalStatusList"
+        - Field "Sex" -> LOV "GenderMelList"
+        """
+        fn = field_name.lower()
+
+        # Direct match: FieldName + "List"
+        for lov_name, opts in lov_data.items():
+            if lov_name.lower() == fn + "list":
+                return opts
+
+        # Common IRCC field-to-LOV mappings
+        mappings = {
+            "placebirthcountry": "CountryOfBirthList",
+            "citizenship": "CountryOfCitizenshipList",
+            "countryofissue": "CountryOfIssueList",
+            "country": "CountryList",
+            "sex": "GenderMelList",
+            "maritalstatus": "MaritalStatusList",
+            "typeofrelationship": "MaritalStatusHistoryList",
+            "nativelang": "ContactLanguageList",
+            "abletocommunicate": "AbleCommunicateEnglishOrFrenchList",
+            "provincestate": "ProvinceAbbrevList",
+            "workpermittype": "WorkPermitTypeList",
+            "lov": "PreferenceLanguageList",
+        }
+
+        mapped_lov = mappings.get(fn)
+        if mapped_lov and mapped_lov in lov_data:
+            return lov_data[mapped_lov]
+
+        return []
 
     def _get_doc(self, doc_id: str) -> OpenDocument:
         if doc_id not in self.documents:
@@ -169,6 +262,14 @@ class XfaPdfEngine:
             }
             if fm.items:
                 entry["items"] = fm.items
+            if fm.options:
+                # Show options as code=label pairs (limit to 20 for large LOVs)
+                if len(fm.options) <= 20:
+                    entry["options"] = [{"code": c, "label": l} for c, l in fm.options]
+                else:
+                    entry["options_count"] = len(fm.options)
+                    entry["options_sample"] = [{"code": c, "label": l} for c, l in fm.options[:10]]
+                    entry["options_hint"] = "Use label or code. Call get_field_values for full list."
             fields.append(entry)
 
         return fields
@@ -242,17 +343,51 @@ class XfaPdfEngine:
                 return fm.items[1]  # second item is "off"
             return ""  # no off value defined — clear it
 
+    def _resolve_choicelist_value(self, doc: OpenDocument, path: str, value: str) -> str:
+        """Resolve a choiceList value — if a label is given, convert to the code.
+
+        Accepts: code directly (e.g. "511"), label (e.g. "Canada"), or
+                 case-insensitive partial match (e.g. "canada").
+        Returns: the code value to store in the XML.
+        """
+        fm = doc.field_meta.get(path)
+        if not fm or fm.field_type != "choiceList" or not fm.options:
+            return value
+
+        # Check if value is already a valid code
+        for code, label in fm.options:
+            if code == value:
+                return value
+
+        # Try exact label match (case-insensitive)
+        v_lower = value.strip().lower()
+        for code, label in fm.options:
+            if label.strip().lower() == v_lower:
+                return code
+
+        # Try partial/contains match
+        for code, label in fm.options:
+            if v_lower in label.strip().lower():
+                return code
+
+        # No match — return as-is (might be a valid code the LOV doesn't have)
+        return value
+
     def fill_fields(self, doc_id: str, field_values: dict[str, str]) -> dict[str, bool]:
         """Fill multiple fields. Returns dict of path -> success.
 
         For checkButton fields, accepts boolean-like values (true/false, yes/no,
         checked/unchecked, on/off, 1/0) and auto-resolves to the correct template
         item value.
+
+        For choiceList fields, accepts either the code or the display label and
+        auto-resolves to the correct code value.
         """
         doc = self._get_doc(doc_id)
         results = {}
         for path, value in field_values.items():
             resolved = self._resolve_checkbox_value(doc, path, value)
+            resolved = self._resolve_choicelist_value(doc, path, resolved)
             results[path] = self._set_value_at_path(doc, path, resolved)
         return results
 
