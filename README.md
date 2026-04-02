@@ -91,7 +91,7 @@ No Adobe Acrobat needed for filling. Output PDFs must be opened in Adobe Reader/
 
 | Tool | Description |
 |------|-------------|
-| `upload_pdf` | Upload an XFA-PDF as base64, returns doc_id and field count |
+| `upload_pdf` | Upload a PDF via URL or base64. URL is preferred for large files. |
 | `list_fields` | List all fillable fields with paths, types, values, and dropdown options |
 | `get_field_values` | Get current values for specific field paths |
 | `fill_fields` | Batch-fill fields with auto-resolution of labels, checkboxes, and dates |
@@ -100,6 +100,8 @@ No Adobe Acrobat needed for filling. Output PDFs must be opened in Adobe Reader/
 | `list_repeating_sections` | List dynamic row sections (dependants, children, employment, etc.) |
 | `add_row` | Add a new row to a repeating section |
 
+> **Upload options:** `upload_pdf` accepts either `pdf_url` (HTTP/HTTPS link to the PDF) or `pdf_base64` (inline base64). URL is recommended for large files to avoid payload size limits.
+>
 > For local stdio mode, `upload_pdf`/`download_pdf` are replaced by `open_pdf` (file path) / `save_pdf` (file path).
 
 ## Workflow

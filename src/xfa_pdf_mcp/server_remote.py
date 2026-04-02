@@ -1,12 +1,22 @@
 """Remote MCP server for XFA-PDF form filling (streamable-http transport)."""
 
 import base64
+import hashlib
 import os
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+import httpx
 from mcp.server.fastmcp import FastMCP
 from xfa_pdf_mcp.engine import XfaPdfEngine
 
 _host = os.environ.get("HOST", "0.0.0.0")
 _port = int(os.environ.get("PORT", "8080"))
+
+# Temporary directory for storing filled PDFs for download
+_tmp_dir = Path(tempfile.mkdtemp(prefix="xfa-pdf-mcp-"))
 
 mcp = FastMCP(
     "xfa-pdf-mcp",
@@ -16,32 +26,72 @@ mcp = FastMCP(
         "This server fills XFA-PDF form fields (e.g. IRCC immigration forms). "
         "Workflow: upload_pdf -> list_fields -> fill_fields -> download_pdf -> close_pdf. "
         "Fields are addressed by their XFA path (e.g. form1/Page1/PersonalDetails/Name/FamilyName). "
-        "Upload PDFs as base64-encoded bytes. Download filled PDFs as base64."
+        "Upload PDFs via URL (preferred for large files) or base64. "
+        "Download filled PDFs as base64 (small files) or chunked."
     ),
 )
 
 engine = XfaPdfEngine()
 
+# Store filled PDF bytes keyed by doc_id for download
+_filled_cache: dict[str, tuple[bytes, str, float]] = {}  # doc_id -> (bytes, filename, timestamp)
+_CACHE_TTL = 1800  # 30 minutes
+
+
+def _cleanup_cache():
+    """Remove expired entries from the filled PDF cache."""
+    now = time.time()
+    expired = [k for k, (_, _, ts) in _filled_cache.items() if now - ts > _CACHE_TTL]
+    for k in expired:
+        del _filled_cache[k]
+
 
 @mcp.tool()
-def upload_pdf(pdf_base64: str, filename: str = "form.pdf") -> dict:
-    """Upload an XFA-PDF form as base64 and get a document ID.
+def upload_pdf(
+    pdf_url: str = "",
+    pdf_base64: str = "",
+    filename: str = "form.pdf",
+) -> dict:
+    """Upload an XFA-PDF form and get a document ID.
+
+    Provide EITHER a URL to download the PDF from OR base64-encoded bytes.
+    URL is preferred for large files (avoids payload size limits).
 
     Args:
-        pdf_base64: Base64-encoded PDF file bytes.
+        pdf_url: URL to download the PDF from (preferred). Supports http/https.
+        pdf_base64: Base64-encoded PDF bytes (alternative for small files).
         filename: Original filename (for reference).
 
     Returns:
         Document ID, form name, and field count.
     """
-    pdf_bytes = base64.b64decode(pdf_base64)
+    if pdf_url:
+        parsed = urlparse(pdf_url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"Invalid URL scheme: {parsed.scheme}. Use http or https.")
+        try:
+            resp = httpx.get(pdf_url, follow_redirects=True, timeout=30)
+            resp.raise_for_status()
+            pdf_bytes = resp.content
+        except httpx.HTTPError as e:
+            raise ValueError(f"Failed to download PDF from URL: {e}")
+        if not filename or filename == "form.pdf":
+            filename = Path(parsed.path).name or "form.pdf"
+    elif pdf_base64:
+        try:
+            pdf_bytes = base64.b64decode(pdf_base64)
+        except Exception:
+            raise ValueError("Invalid base64 encoding")
+    else:
+        raise ValueError("Provide either pdf_url or pdf_base64")
+
     doc_id = engine.open_bytes(pdf_bytes, filename)
     fields = engine.list_fields(doc_id)
     return {
         "doc_id": doc_id,
         "file": filename,
         "field_count": len(fields),
-        "message": f"Uploaded {filename} with {len(fields)} fields.",
+        "message": f"Uploaded {filename} with {len(fields)} fields. Use list_fields to see them.",
     }
 
 
@@ -51,7 +101,7 @@ def list_fields(doc_id: str, filter_type: str = "") -> list[dict]:
 
     Args:
         doc_id: Document ID from upload_pdf.
-        filter_type: Optional filter by field type.
+        filter_type: Optional filter by field type (e.g. 'textEdit', 'choiceList', 'checkButton').
     """
     fields = engine.list_fields(doc_id)
     if filter_type:
@@ -77,6 +127,7 @@ def fill_fields(doc_id: str, field_values: dict[str, str]) -> dict:
     Args:
         doc_id: Document ID from upload_pdf.
         field_values: Dict mapping field paths to values.
+            Labels are auto-resolved: "Canada" -> "511", "true" -> "Y", "01/15/2025" -> "2025-01-15"
     """
     results = engine.fill_fields(doc_id, field_values)
     filled_count = sum(1 for v in results.values() if v)
@@ -88,19 +139,22 @@ def fill_fields(doc_id: str, field_values: dict[str, str]) -> dict:
 
 @mcp.tool()
 def download_pdf(doc_id: str) -> dict:
-    """Download the filled PDF as base64.
+    """Get the filled PDF as base64.
 
     Args:
         doc_id: Document ID from upload_pdf.
 
     Returns:
-        Base64-encoded PDF bytes and filename.
+        Base64-encoded PDF bytes, filename, and size.
     """
+    _cleanup_cache()
     doc = engine._get_doc(doc_id)
     pdf_bytes = engine.save_bytes(doc_id)
+    filename = f"filled_{doc.source_path.name}"
+
     return {
         "pdf_base64": base64.b64encode(pdf_bytes).decode("ascii"),
-        "filename": f"filled_{doc.source_path.name}",
+        "filename": filename,
         "size_bytes": len(pdf_bytes),
     }
 
@@ -135,6 +189,8 @@ def close_pdf(doc_id: str) -> dict:
         doc_id: Document ID from upload_pdf.
     """
     engine.close(doc_id)
+    if doc_id in _filled_cache:
+        del _filled_cache[doc_id]
     return {"message": f"Document {doc_id} closed."}
 
 

@@ -18,6 +18,7 @@ dependencies = [
     "mcp[cli]>=1.0.0",
     "pikepdf>=8.0.0",
     "lxml>=4.9.0",
+    "httpx>=0.24.0",
 ]
 
 [project.optional-dependencies]
