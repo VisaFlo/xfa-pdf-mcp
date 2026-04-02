@@ -11,7 +11,7 @@ No installation required. Connect to the hosted server with a single config line
 ### Claude Code
 
 ```bash
-claude mcp add --transport http xfa-pdf https://xfa-pdf-mcp.visaflo.com/mcp
+claude mcp add --transport http xfa-pdf https://xfa-pdf-mcp.vflo.app/mcp
 ```
 
 ### Claude Desktop
@@ -23,33 +23,11 @@ Add to `claude_desktop_config.json`:
   "mcpServers": {
     "xfa-pdf": {
       "type": "streamable-http",
-      "url": "https://xfa-pdf-mcp.visaflo.com/mcp"
+      "url": "https://xfa-pdf-mcp.vflo.app/mcp"
     }
   }
 }
 ```
-
-### ChatGPT / Other LLMs
-
-Use the REST API at `https://xfa-pdf-mcp.visaflo.com/api/`:
-
-```bash
-# Upload a PDF
-curl -F "file=@imm5257e.pdf" https://xfa-pdf-mcp.visaflo.com/api/upload
-
-# List fields
-curl https://xfa-pdf-mcp.visaflo.com/api/documents/{doc_id}/fields
-
-# Fill fields
-curl -X POST https://xfa-pdf-mcp.visaflo.com/api/documents/{doc_id}/fill \
-  -H "Content-Type: application/json" \
-  -d '{"field_values": {"form1/Page1/PersonalDetails/Name/FamilyName": "KIM"}}'
-
-# Download filled PDF
-curl https://xfa-pdf-mcp.visaflo.com/api/documents/{doc_id}/download -o filled.pdf
-```
-
-OpenAPI spec: `https://xfa-pdf-mcp.visaflo.com/api/openapi.json`
 
 ## Self-Hosted Setup
 
@@ -57,12 +35,10 @@ OpenAPI spec: `https://xfa-pdf-mcp.visaflo.com/api/openapi.json`
 
 ```bash
 docker run -p 8080:8080 ghcr.io/visaflo/xfa-pdf-mcp
-
-# Or for REST API mode:
-docker run -p 8080:8080 ghcr.io/visaflo/xfa-pdf-mcp python -m xfa_pdf_mcp.api
 ```
 
 Then connect Claude:
+
 ```bash
 claude mcp add --transport http xfa-pdf http://localhost:8080/mcp
 ```
@@ -97,46 +73,34 @@ No Adobe Acrobat needed for filling. Output PDFs must be opened in Adobe Reader/
 
 ## Tools
 
-### MCP Tools (Claude Desktop / Claude Code)
-
 | Tool | Description |
 |------|-------------|
-| `open_pdf` / `upload_pdf` | Open an XFA-PDF (local path or base64 upload) |
+| `upload_pdf` | Upload an XFA-PDF as base64, returns doc_id and field count |
 | `list_fields` | List all fillable fields with paths, types, values, and dropdown options |
 | `get_field_values` | Get current values for specific field paths |
 | `fill_fields` | Batch-fill fields with auto-resolution of labels, checkboxes, and dates |
-| `save_pdf` / `download_pdf` | Save/download the filled PDF |
+| `download_pdf` | Download the filled PDF as base64 |
 | `close_pdf` | Close and free resources |
 | `list_repeating_sections` | List dynamic row sections (dependants, children, employment, etc.) |
 | `add_row` | Add a new row to a repeating section |
 
-### REST API Endpoints (ChatGPT / Other LLMs)
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/upload` | Upload PDF file, returns doc_id |
-| GET | `/documents/{id}/fields` | List all fields |
-| POST | `/documents/{id}/fill` | Fill fields |
-| GET | `/documents/{id}/download` | Download filled PDF |
-| GET | `/documents/{id}/repeating-sections` | List dynamic sections |
-| POST | `/documents/{id}/add-row` | Add row to repeating section |
-| DELETE | `/documents/{id}` | Close document |
+> For local stdio mode, `upload_pdf`/`download_pdf` are replaced by `open_pdf` (file path) / `save_pdf` (file path).
 
 ## Workflow
 
 ```
-open_pdf -> list_fields -> fill_fields -> save_pdf -> close_pdf
+upload_pdf -> list_fields -> fill_fields -> download_pdf -> close_pdf
 ```
 
 For forms with dynamic rows:
 
 ```
-open_pdf -> list_repeating_sections -> add_row (repeat) -> save_pdf -> close_pdf
+upload_pdf -> list_repeating_sections -> add_row (repeat) -> download_pdf -> close_pdf
 ```
 
 ## Smart Value Resolution
 
-The server automatically resolves human-readable values to the correct form codes:
+The server automatically resolves human-readable values to the correct form codes.
 
 ### Dropdowns (choiceList)
 
@@ -194,12 +158,20 @@ add_row(doc_id, "IMM_5707/page1/SectionB/Child", {
 
 ## Example
 
-```
-"Open the IMM5257 form at ~/Downloads/imm5257e.pdf, list the personal details fields,
-fill in: FamilyName=KIM, GivenName=YULBIN, Sex=Male, PlaceBirthCountry=Korea South,
-Citizenship=Korea South, DOBYear=1990, DOBMonth=01, DOBDay=15.
-Save to ~/Desktop/imm5257_filled.pdf"
-```
+> "Open the IMM5257 form at ~/Downloads/imm5257e.pdf, list the personal details fields, fill in: FamilyName=KIM, GivenName=YULBIN, Sex=Male, PlaceBirthCountry=Korea South, Citizenship=Korea South, DOBYear=1990, DOBMonth=01, DOBDay=15. Save to ~/Desktop/imm5257_filled.pdf"
+
+## Field Types
+
+| Type | Description |
+|------|-------------|
+| `textEdit` | Free text input |
+| `choiceList` | Dropdown with LOV options (auto-resolved) |
+| `checkButton` | Checkbox (auto-resolved from true/false) |
+| `dateTimeEdit` | Date picker (auto-normalized to YYYY-MM-DD) |
+| `numericEdit` | Number input |
+| `picture` | Masked input (dates, postal codes) |
+| `barcode` | Auto-generated barcode (read-only) |
+| `signature` | Signature field |
 
 ## Testing
 
@@ -242,22 +214,21 @@ Verified with 95+ IRCC immigration forms including:
 ## Architecture
 
 ```
-                        +-----------------+
-                        |  XfaPdfEngine   |
-                        | (pikepdf+lxml)  |
-                        +--------+--------+
-                                 |
-              +------------------+------------------+
-              |                  |                  |
-    +---------v--------+ +------v-------+ +--------v--------+
-    | Local MCP Server | | Remote MCP   | | REST API        |
-    | (stdio)          | | (HTTP)       | | (FastAPI)       |
-    | server.py        | | server_      | | api.py          |
-    |                  | | remote.py    | |                 |
-    +------------------+ +--------------+ +-----------------+
-              |                  |                  |
-    Claude Code/Desktop   Claude Desktop    ChatGPT, Gemini,
-    (local install)       (hosted URL)      other LLMs
+                     +------------------+
+                     |   XfaPdfEngine   |
+                     |  (pikepdf+lxml)  |
+                     +--------+---------+
+                              |
+              +---------------+---------------+
+              |                               |
+    +---------v----------+        +-----------v-----------+
+    |  Local MCP Server  |        |  Remote MCP Server    |
+    |  (stdio)           |        |  (streamable-http)    |
+    |  server.py         |        |  server_remote.py     |
+    +--------------------+        +-----------------------+
+              |                               |
+    Claude Code/Desktop           Claude Desktop/Code
+    (local install)               (hosted — no install)
 ```
 
 ## Deployment
@@ -265,20 +236,14 @@ Verified with 95+ IRCC immigration forms including:
 ### Google Cloud Run
 
 ```bash
-# MCP server
 gcloud run deploy xfa-pdf-mcp --source . --region us-central1 --allow-unauthenticated
-
-# REST API
-gcloud run deploy xfa-pdf-api --source . --region us-central1 --allow-unauthenticated \
-  --command "python,-m,xfa_pdf_mcp.api"
 ```
 
 ### Docker
 
 ```bash
 docker build -t xfa-pdf-mcp .
-docker run -p 8080:8080 xfa-pdf-mcp                              # MCP server
-docker run -p 8080:8080 xfa-pdf-mcp python -m xfa_pdf_mcp.api    # REST API
+docker run -p 8080:8080 xfa-pdf-mcp
 ```
 
 ## Limitations
@@ -287,7 +252,7 @@ docker run -p 8080:8080 xfa-pdf-mcp python -m xfa_pdf_mcp.api    # REST API
 - Fields with `bind="none"` in the template cannot be filled via datasets
 - Embedded JavaScript validation only runs in Adobe Reader
 - Digital signatures are stripped on save (required to avoid "certification invalid" warnings)
-- A small number of forms (e.g. IMM 5444) have no LOV data; dropdowns in those forms require raw code values
+- A small number of forms (e.g. IMM 5444) have no LOV data; dropdowns require raw code values
 - Non-XFA PDFs (AcroForm only) are not supported
 
 ## License

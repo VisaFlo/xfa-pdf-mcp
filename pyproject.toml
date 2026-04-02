@@ -18,9 +18,6 @@ dependencies = [
     "mcp[cli]>=1.0.0",
     "pikepdf>=8.0.0",
     "lxml>=4.9.0",
-    "fastapi>=0.100.0",
-    "uvicorn>=0.20.0",
-    "python-multipart>=0.0.6",
 ]
 
 [project.optional-dependencies]
@@ -31,7 +28,6 @@ dev = [
 [project.scripts]
 xfa-pdf-mcp = "xfa_pdf_mcp.server:main"
 xfa-pdf-mcp-remote = "xfa_pdf_mcp.server_remote:main"
-xfa-pdf-api = "xfa_pdf_mcp.api:main"
 
 [project.urls]
 Repository = "https://github.com/VisaFlo/xfa-pdf-mcp"
