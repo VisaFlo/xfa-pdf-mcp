@@ -4,6 +4,85 @@ An MCP (Model Context Protocol) server for reading and filling XFA-PDF form fiel
 
 Tested against **95+ IRCC immigration forms** with 100% roundtrip success.
 
+## Quick Start (Hosted)
+
+No installation required. Connect to the hosted server with a single config line.
+
+### Claude Code
+
+```bash
+claude mcp add --transport http xfa-pdf https://xfa-pdf-mcp.visaflo.com/mcp
+```
+
+### Claude Desktop
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "xfa-pdf": {
+      "type": "streamable-http",
+      "url": "https://xfa-pdf-mcp.visaflo.com/mcp"
+    }
+  }
+}
+```
+
+### ChatGPT / Other LLMs
+
+Use the REST API at `https://xfa-pdf-mcp.visaflo.com/api/`:
+
+```bash
+# Upload a PDF
+curl -F "file=@imm5257e.pdf" https://xfa-pdf-mcp.visaflo.com/api/upload
+
+# List fields
+curl https://xfa-pdf-mcp.visaflo.com/api/documents/{doc_id}/fields
+
+# Fill fields
+curl -X POST https://xfa-pdf-mcp.visaflo.com/api/documents/{doc_id}/fill \
+  -H "Content-Type: application/json" \
+  -d '{"field_values": {"form1/Page1/PersonalDetails/Name/FamilyName": "KIM"}}'
+
+# Download filled PDF
+curl https://xfa-pdf-mcp.visaflo.com/api/documents/{doc_id}/download -o filled.pdf
+```
+
+OpenAPI spec: `https://xfa-pdf-mcp.visaflo.com/api/openapi.json`
+
+## Self-Hosted Setup
+
+### Option 1: Docker (Recommended)
+
+```bash
+docker run -p 8080:8080 ghcr.io/visaflo/xfa-pdf-mcp
+
+# Or for REST API mode:
+docker run -p 8080:8080 ghcr.io/visaflo/xfa-pdf-mcp python -m xfa_pdf_mcp.api
+```
+
+Then connect Claude:
+```bash
+claude mcp add --transport http xfa-pdf http://localhost:8080/mcp
+```
+
+### Option 2: Local (stdio)
+
+Requires Python 3.11+.
+
+```bash
+git clone https://github.com/VisaFlo/xfa-pdf-mcp.git
+cd xfa-pdf-mcp
+python3 -m venv .venv
+.venv/bin/pip install -e .
+```
+
+```bash
+claude mcp add --transport stdio --scope user xfa-pdf-mcp \
+  /path/to/xfa-pdf-mcp/.venv/bin/python -- -m xfa_pdf_mcp.server
+```
+
 ## How It Works
 
 XFA-PDFs embed form definitions and data as XML inside a PDF container. This server:
@@ -16,53 +95,32 @@ XFA-PDFs embed form definitions and data as XML inside a PDF container. This ser
 
 No Adobe Acrobat needed for filling. Output PDFs must be opened in Adobe Reader/Acrobat to render correctly (browsers don't support XFA).
 
-## Installation
-
-```bash
-git clone https://github.com/VisaFlo/xfa-pdf-mcp.git
-cd xfa-pdf-mcp
-python3 -m venv .venv
-.venv/bin/pip install -e .
-```
-
-Requires Python 3.11+.
-
-## Configuration
-
-### Claude Code
-
-```bash
-claude mcp add --transport stdio --scope user xfa-pdf-mcp \
-  /path/to/xfa-pdf-mcp/.venv/bin/python -- -m xfa_pdf_mcp.server
-```
-
-### Claude Desktop
-
-Add to `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "xfa-pdf-mcp": {
-      "command": "/path/to/xfa-pdf-mcp/.venv/bin/python",
-      "args": ["-m", "xfa_pdf_mcp.server"]
-    }
-  }
-}
-```
-
 ## Tools
+
+### MCP Tools (Claude Desktop / Claude Code)
 
 | Tool | Description |
 |------|-------------|
-| `open_pdf` | Open an XFA-PDF, returns doc_id and field count |
+| `open_pdf` / `upload_pdf` | Open an XFA-PDF (local path or base64 upload) |
 | `list_fields` | List all fillable fields with paths, types, values, and dropdown options |
 | `get_field_values` | Get current values for specific field paths |
 | `fill_fields` | Batch-fill fields with auto-resolution of labels, checkboxes, and dates |
-| `save_pdf` | Save the filled PDF to a new file |
+| `save_pdf` / `download_pdf` | Save/download the filled PDF |
 | `close_pdf` | Close and free resources |
 | `list_repeating_sections` | List dynamic row sections (dependants, children, employment, etc.) |
 | `add_row` | Add a new row to a repeating section |
+
+### REST API Endpoints (ChatGPT / Other LLMs)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/upload` | Upload PDF file, returns doc_id |
+| GET | `/documents/{id}/fields` | List all fields |
+| POST | `/documents/{id}/fill` | Fill fields |
+| GET | `/documents/{id}/download` | Download filled PDF |
+| GET | `/documents/{id}/repeating-sections` | List dynamic sections |
+| POST | `/documents/{id}/add-row` | Add row to repeating section |
+| DELETE | `/documents/{id}` | Close document |
 
 ## Workflow
 
@@ -123,7 +181,7 @@ Some forms have repeating sections (dependants, children, employment history, et
 ```python
 # List available repeating sections
 sections = list_repeating_sections(doc_id)
-# -> [{"path": "IMM_5707/page1/SectionB/Child", "max": -1, "current_count": 4, "field_names": [...]}]
+# -> [{"path": "IMM_5707/page1/SectionB/Child", "max": -1, "current_count": 4, ...}]
 
 # Add a new row
 add_row(doc_id, "IMM_5707/page1/SectionB/Child", {
@@ -133,32 +191,6 @@ add_row(doc_id, "IMM_5707/page1/SectionB/Child", {
     "DOBYear": "2005",
 })
 ```
-
-## Field Paths
-
-Fields use XFA template paths. Examples from IMM5257 (TRV Application):
-
-```
-form1/Page1/PersonalDetails/Name/FamilyName
-form1/Page1/PersonalDetails/Name/GivenName
-form1/Page1/PersonalDetails/Sex/Sex
-form1/Page1/PersonalDetails/DOBYear
-form1/Page1/PersonalDetails/PlaceBirthCountry
-form1/Page1/PersonalDetails/Citizenship/Citizenship
-```
-
-## Field Types
-
-| Type | Description |
-|------|-------------|
-| `textEdit` | Free text input |
-| `choiceList` | Dropdown with LOV options |
-| `checkButton` | Checkbox with template-defined on/off values |
-| `dateTimeEdit` | Date picker (YYYY-MM-DD) |
-| `numericEdit` | Number input |
-| `picture` | Masked input (dates, postal codes) |
-| `barcode` | Auto-generated barcode (read-only) |
-| `signature` | Signature field |
 
 ## Example
 
@@ -172,8 +204,11 @@ Save to ~/Desktop/imm5257_filled.pdf"
 ## Testing
 
 ```bash
-# Unit tests (require imm5257e.pdf in tests/fixtures/)
-.venv/bin/pytest tests/test_engine.py -v
+# All tests (42 total)
+.venv/bin/pytest tests/ -v
+
+# Unit tests only
+.venv/bin/pytest tests/test_engine.py tests/test_engine_bytes.py -v
 
 # Integration tests (require IMM PDFs in ~/Downloads/)
 .venv/bin/pytest tests/test_integration.py -v
@@ -207,19 +242,43 @@ Verified with 95+ IRCC immigration forms including:
 ## Architecture
 
 ```
-pikepdf (PDF I/O) + lxml (XML parsing)
-    |
-    v
-XfaPdfEngine (stateful, keeps docs open in memory)
-    |-- open(): extract XFA streams, build field/LOV metadata
-    |-- list_fields(): return fields with types, values, options
-    |-- fill_fields(): set values with auto-resolution
-    |-- add_row(): add repeating section instances
-    |-- save(): write XML back, strip signatures
-    |-- close(): free resources
-    |
-    v
-FastMCP server (8 tools over stdio)
+                        +-----------------+
+                        |  XfaPdfEngine   |
+                        | (pikepdf+lxml)  |
+                        +--------+--------+
+                                 |
+              +------------------+------------------+
+              |                  |                  |
+    +---------v--------+ +------v-------+ +--------v--------+
+    | Local MCP Server | | Remote MCP   | | REST API        |
+    | (stdio)          | | (HTTP)       | | (FastAPI)       |
+    | server.py        | | server_      | | api.py          |
+    |                  | | remote.py    | |                 |
+    +------------------+ +--------------+ +-----------------+
+              |                  |                  |
+    Claude Code/Desktop   Claude Desktop    ChatGPT, Gemini,
+    (local install)       (hosted URL)      other LLMs
+```
+
+## Deployment
+
+### Google Cloud Run
+
+```bash
+# MCP server
+gcloud run deploy xfa-pdf-mcp --source . --region us-central1 --allow-unauthenticated
+
+# REST API
+gcloud run deploy xfa-pdf-api --source . --region us-central1 --allow-unauthenticated \
+  --command "python,-m,xfa_pdf_mcp.api"
+```
+
+### Docker
+
+```bash
+docker build -t xfa-pdf-mcp .
+docker run -p 8080:8080 xfa-pdf-mcp                              # MCP server
+docker run -p 8080:8080 xfa-pdf-mcp python -m xfa_pdf_mcp.api    # REST API
 ```
 
 ## Limitations
