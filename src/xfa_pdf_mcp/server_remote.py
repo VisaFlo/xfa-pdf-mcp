@@ -5,8 +5,13 @@ import os
 from mcp.server.fastmcp import FastMCP
 from xfa_pdf_mcp.engine import XfaPdfEngine
 
+_host = os.environ.get("HOST", "0.0.0.0")
+_port = int(os.environ.get("PORT", "8080"))
+
 mcp = FastMCP(
     "xfa-pdf-mcp",
+    host=_host,
+    port=_port,
     instructions=(
         "This server fills XFA-PDF form fields (e.g. IRCC immigration forms). "
         "Workflow: upload_pdf -> list_fields -> fill_fields -> download_pdf -> close_pdf. "
@@ -134,9 +139,7 @@ def close_pdf(doc_id: str) -> dict:
 
 
 def main():
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "8080"))
-    mcp.run(transport="streamable-http", host=host, port=port)
+    mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":
