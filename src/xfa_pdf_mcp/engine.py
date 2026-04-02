@@ -645,6 +645,23 @@ class XfaPdfEngine:
                             off_val = peer_fm.items[1] if len(peer_fm.items) >= 2 else ""
                             self._set_value_at_path(doc, peer_path, off_val)
 
+            # Enforce phone field consistency when CanadaUS/Other is toggled
+            field_name = path.split("/")[-1]
+            if field_name in ("CanadaUS", "Other") and fm and fm.field_type == "checkButton":
+                parent_path = "/".join(path.split("/")[:-1])
+                v_lower = value.strip().lower()
+                is_on = v_lower in ("true", "checked", "on", "yes", "1", "y")
+                if is_on:
+                    if field_name == "CanadaUS":
+                        # Switching to Canada/US: clear international fields
+                        self._set_value_at_path(doc, parent_path + "/IntlNumber/IntlNumber", "")
+                        self._set_value_at_path(doc, parent_path + "/NumberCountry", "1")
+                    elif field_name == "Other":
+                        # Switching to International: clear NA fields
+                        self._set_value_at_path(doc, parent_path + "/NANumber/AreaCode", "")
+                        self._set_value_at_path(doc, parent_path + "/NANumber/FirstThree", "")
+                        self._set_value_at_path(doc, parent_path + "/NANumber/LastFive", "")
+
         return results
 
     def list_repeating_sections(self, doc_id: str) -> list[dict]:
