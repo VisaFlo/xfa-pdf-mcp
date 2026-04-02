@@ -1,5 +1,6 @@
 """Core XFA-PDF manipulation engine using pikepdf + lxml."""
 
+import io
 import re
 import uuid
 from pathlib import Path
@@ -68,6 +69,23 @@ class XfaPdfEngine:
         except Exception as e:
             raise ValueError(f"Cannot open PDF: {e}")
 
+        return self._init_document(pdf, path.name)
+
+    def open_bytes(self, pdf_bytes: bytes, filename: str = "upload.pdf") -> str:
+        """Open an XFA-PDF from raw bytes and return a document ID."""
+        try:
+            pdf = pikepdf.Pdf.open(io.BytesIO(pdf_bytes))
+        except Exception as e:
+            raise ValueError(f"Cannot open PDF: {e}")
+
+        return self._init_document(pdf, filename)
+
+    def _init_document(self, pdf: pikepdf.Pdf, filename: str) -> str:
+        """Parse XFA structure from an already-opened pikepdf.Pdf and register it.
+
+        Shared logic used by both open() and open_bytes().
+        Returns the new document ID.
+        """
         acroform = pdf.Root.get("/AcroForm")
         if not acroform:
             raise ValueError("No XFA: PDF has no AcroForm")
@@ -114,7 +132,7 @@ class XfaPdfEngine:
         detected_ns = template_ns or TEMPLATE_NS_PREFIXES[0]
         doc = OpenDocument(
             pdf=pdf,
-            source_path=path,
+            source_path=Path(filename),
             xfa_array=xfa,
             datasets_index=datasets_index,
             datasets_root=datasets_root,
@@ -672,11 +690,11 @@ class XfaPdfEngine:
             if kids:
                 self._strip_signature_fields(kids)
 
-    def save(self, doc_id: str, output_path: Path) -> Path:
-        """Write modified datasets back to the PDF and save."""
-        doc = self._get_doc(doc_id)
-        output_path = Path(output_path)
+    def _prepare_for_save(self, doc: OpenDocument) -> None:
+        """Serialize modified datasets XML back into the PDF and strip signatures.
 
+        Shared logic used by both save() and save_bytes().
+        """
         modified_xml = etree.tostring(
             doc.datasets_root, xml_declaration=False, encoding="unicode"
         ).encode("utf-8")
@@ -695,8 +713,25 @@ class XfaPdfEngine:
             # Remove signature field values from form fields
             self._strip_signature_fields(acroform.get("/Fields", []))
 
+    def save(self, doc_id: str, output_path: Path) -> Path:
+        """Write modified datasets back to the PDF and save."""
+        doc = self._get_doc(doc_id)
+        output_path = Path(output_path)
+
+        self._prepare_for_save(doc)
+
         doc.pdf.save(output_path)
         return output_path
+
+    def save_bytes(self, doc_id: str) -> bytes:
+        """Write modified datasets back to the PDF and return as bytes."""
+        doc = self._get_doc(doc_id)
+
+        self._prepare_for_save(doc)
+
+        buf = io.BytesIO()
+        doc.pdf.save(buf)
+        return buf.getvalue()
 
     def close(self, doc_id: str) -> None:
         """Close document and free resources."""
