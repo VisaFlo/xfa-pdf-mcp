@@ -27,6 +27,7 @@ class FieldMeta:
     items: list[str]  # for checkButton: [on_value] or [on, off, neutral]
     options: list[tuple[str, str]] = field(default_factory=list)  # for choiceList: [(code, label), ...]
     format_pattern: str = ""  # for dateTimeEdit/picture: the expected format pattern
+    excl_group_peers: list[str] = field(default_factory=list)  # paths of mutually exclusive peers
 
 
 @dataclass
@@ -302,7 +303,57 @@ class XfaPdfEngine:
                 options=options,
                 format_pattern=format_pattern,
             )
+
+        # Second pass: detect exclusion groups and wire up mutual exclusion
+        self._wire_exclusion_groups(template_root, ns_t, meta)
         return meta
+
+    def _wire_exclusion_groups(self, template_root, ns_t: str, meta: dict) -> None:
+        """Detect exclGroup elements and paired checkboxes, wire mutual exclusion."""
+        # 1. Handle explicit exclGroup elements
+        for eg in template_root.iter(f"{{{ns_t}}}exclGroup"):
+            member_paths = []
+            for child in eg:
+                child_name = child.get("name", "")
+                if not child_name:
+                    continue
+                tag = etree.QName(child.tag).localname
+                if tag == "field":
+                    # Build full path
+                    path_parts = []
+                    parent = eg.getparent()
+                    while parent is not None:
+                        pname = parent.get("name", "")
+                        if pname:
+                            path_parts.insert(0, pname)
+                        parent = parent.getparent()
+                    eg_name = eg.get("name", "")
+                    if eg_name:
+                        path_parts.append(eg_name)
+                    full_path = "/".join(path_parts) + "/" + child_name
+                    if full_path in meta:
+                        member_paths.append(full_path)
+
+            # Wire each member to know about its peers
+            for path in member_paths:
+                meta[path].excl_group_peers = [p for p in member_paths if p != path]
+
+        # 2. Handle CanadaUS/Other pattern (JS-driven mutual exclusion)
+        # These are sibling checkButton fields in the same subform that act as radio buttons
+        canada_us_pairs = [
+            ("CanadaUS", "Other"),
+        ]
+        for path, fm in meta.items():
+            if fm.field_type != "checkButton":
+                continue
+            field_name = path.split("/")[-1]
+            parent_path = "/".join(path.split("/")[:-1])
+            for name_a, name_b in canada_us_pairs:
+                if field_name == name_a:
+                    peer_path = parent_path + "/" + name_b
+                    if peer_path in meta and not fm.excl_group_peers:
+                        fm.excl_group_peers = [peer_path]
+                        meta[peer_path].excl_group_peers = [path]
 
     def _match_lov(self, field_name: str, lov_data: dict) -> list[tuple[str, str]]:
         """Try to match a choiceList field name to a LOV list by convention.
@@ -580,6 +631,20 @@ class XfaPdfEngine:
             resolved = self._resolve_choicelist_value(doc, path, resolved)
             resolved = self._normalize_date(doc, path, resolved)
             results[path] = self._set_value_at_path(doc, path, resolved)
+
+            # Enforce mutual exclusion for checkboxes in exclusion groups
+            fm = doc.field_meta.get(path)
+            if fm and fm.field_type == "checkButton" and fm.excl_group_peers:
+                # If this checkbox is being turned ON, turn OFF its peers
+                v_lower = value.strip().lower()
+                is_on = v_lower in ("true", "checked", "on", "yes", "1", "y")
+                if is_on or (fm.items and resolved == fm.items[0]):
+                    for peer_path in fm.excl_group_peers:
+                        peer_fm = doc.field_meta.get(peer_path)
+                        if peer_fm and peer_fm.items:
+                            off_val = peer_fm.items[1] if len(peer_fm.items) >= 2 else ""
+                            self._set_value_at_path(doc, peer_path, off_val)
+
         return results
 
     def list_repeating_sections(self, doc_id: str) -> list[dict]:
