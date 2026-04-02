@@ -1,0 +1,17 @@
+[project]
+name = "xfa-pdf-mcp"
+version = "0.1.0"
+description = "MCP server for filling XFA-PDF form fields"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "pikepdf>=8.0.0",
+    "lxml>=4.9.0",
+]
+
+[project.scripts]
+xfa-pdf-mcp = "xfa_pdf_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
