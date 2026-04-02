@@ -1,7 +1,11 @@
 """Core XFA-PDF manipulation engine using pikepdf + lxml."""
 
 import io
+import json
+import os
 import re
+import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -52,6 +56,9 @@ class OpenDocument:
     template_ns: str
     template_root: Any
     template_index: int = -1  # index in XFA array for template stream
+    form_root: Any = None  # lxml Element for the form section (runtime state)
+    form_index: int = -1  # index in XFA array for the form stream
+    original_bytes: bytes = b""  # original PDF bytes for iText save (bytes mode only)
     field_meta: dict[str, FieldMeta] = field(default_factory=dict)
     lov_data: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
     repeating_sections: list[RepeatingSection] = field(default_factory=list)
@@ -71,7 +78,7 @@ class XfaPdfEngine:
         except Exception as e:
             raise ValueError(f"Cannot open PDF: {e}")
 
-        return self._init_document(pdf, path.name)
+        return self._init_document(pdf, str(path.resolve()))
 
     def open_bytes(self, pdf_bytes: bytes, filename: str = "upload.pdf") -> str:
         """Open an XFA-PDF from raw bytes and return a document ID."""
@@ -80,7 +87,10 @@ class XfaPdfEngine:
         except Exception as e:
             raise ValueError(f"Cannot open PDF: {e}")
 
-        return self._init_document(pdf, filename)
+        doc_id = self._init_document(pdf, filename)
+        # Store original bytes for iText signature-preserving save
+        self.documents[doc_id].original_bytes = pdf_bytes
+        return doc_id
 
     def _init_document(self, pdf: pikepdf.Pdf, filename: str) -> str:
         """Parse XFA structure from an already-opened pikepdf.Pdf and register it.
@@ -104,6 +114,8 @@ class XfaPdfEngine:
         template_root = None
         template_ns = None
         template_index = None
+        form_root = None
+        form_index = None
 
         for i in range(0, len(xfa), 2):
             key = str(xfa[i])
@@ -115,6 +127,10 @@ class XfaPdfEngine:
                 template_index = i + 1
                 tmpl_bytes = bytes(xfa[i + 1].read_bytes())
                 template_root = etree.fromstring(tmpl_bytes)
+            elif key == "form":
+                form_index = i + 1
+                form_bytes = bytes(xfa[i + 1].read_bytes())
+                form_root = etree.fromstring(form_bytes)
                 root_ns = template_root.tag.split("}")[0].lstrip("{") if "}" in template_root.tag else ""
                 if root_ns:
                     template_ns = root_ns
@@ -144,6 +160,8 @@ class XfaPdfEngine:
             template_ns=detected_ns,
             template_root=template_root,
             template_index=template_index or -1,
+            form_root=form_root,
+            form_index=form_index or -1,
         )
         # Extract LOV (List of Values) from datasets for dropdown lookups
         doc.lov_data = self._extract_lov(datasets_root)
@@ -819,16 +837,56 @@ class XfaPdfEngine:
 
         Adobe Reader uses presence attributes to show/hide subforms. Since we
         don't run JavaScript, we must set these based on the filled data.
+        Used by pikepdf fallback save (which strips signatures anyway).
         """
         ns_t = doc.template_ns
-
-        # Find all Phone/AltPhone/FaxEmail Phone subforms with CanadaUS/Other data
         for subform in doc.template_root.iter(f"{{{ns_t}}}subform"):
             sf_name = subform.get("name", "")
             if sf_name not in ("Phone", "AltPhone"):
                 continue
+            path_parts = []
+            parent = subform.getparent()
+            while parent is not None:
+                pname = parent.get("name", "")
+                if pname:
+                    path_parts.insert(0, pname)
+                parent = parent.getparent()
+            data_path = "/".join(path_parts) + "/" + sf_name
+            canada_us = self._get_value_at_path(doc, data_path + "/CanadaUS")
+            for child_sf in subform:
+                if not isinstance(child_sf.tag, str):
+                    continue
+                child_tag = etree.QName(child_sf.tag).localname if "}" in child_sf.tag else child_sf.tag
+                if child_tag != "subform":
+                    continue
+                child_name = child_sf.get("name", "")
+                if child_name == "NANumber":
+                    child_sf.set("presence", "visible" if canada_us == "1" else "invisible")
+                elif child_name == "IntlNumber":
+                    child_sf.set("presence", "invisible" if canada_us == "1" else "visible")
 
-            # Build the data path for this subform
+    def _sync_form_presence(self, doc: OpenDocument) -> None:
+        """Update the XFA form section's presence attributes based on data values.
+
+        The form section stores runtime state (like JS-driven visibility changes).
+        Modifying it is allowed under DocMDP /P:2 and preserves signatures.
+        """
+        if doc.form_root is None:
+            return
+
+        # Detect the form namespace
+        form_ns = ""
+        if "}" in doc.form_root.tag:
+            form_ns = doc.form_root.tag.split("}")[0].lstrip("{")
+
+        ns_prefix = f"{{{form_ns}}}" if form_ns else ""
+
+        for subform in doc.form_root.iter(f"{ns_prefix}subform"):
+            sf_name = subform.get("name", "")
+            if sf_name not in ("Phone", "AltPhone"):
+                continue
+
+            # Build data path
             path_parts = []
             parent = subform.getparent()
             while parent is not None:
@@ -838,27 +896,19 @@ class XfaPdfEngine:
                 parent = parent.getparent()
             data_path = "/".join(path_parts) + "/" + sf_name
 
-            # Check CanadaUS value in data
             canada_us = self._get_value_at_path(doc, data_path + "/CanadaUS")
 
-            # Find NANumber and IntlNumber child subforms
             for child_sf in subform:
                 if not isinstance(child_sf.tag, str):
-                    continue  # skip ProcessingInstructions, Comments
+                    continue
                 child_tag = etree.QName(child_sf.tag).localname if "}" in child_sf.tag else child_sf.tag
                 if child_tag != "subform":
                     continue
                 child_name = child_sf.get("name", "")
                 if child_name == "NANumber":
-                    if canada_us == "1":
-                        child_sf.set("presence", "visible")
-                    elif canada_us == "0":
-                        child_sf.set("presence", "invisible")
+                    child_sf.set("presence", "visible" if canada_us == "1" else "invisible")
                 elif child_name == "IntlNumber":
-                    if canada_us == "1":
-                        child_sf.set("presence", "invisible")
-                    elif canada_us == "0":
-                        child_sf.set("presence", "visible")
+                    child_sf.set("presence", "invisible" if canada_us == "1" else "visible")
 
     def _prepare_for_save(self, doc: OpenDocument) -> None:
         """Serialize modified datasets XML back into the PDF and strip signatures.
@@ -893,22 +943,134 @@ class XfaPdfEngine:
             # Remove signature field values from form fields
             self._strip_signature_fields(acroform.get("/Fields", []))
 
+    def _has_signatures(self, doc: OpenDocument) -> bool:
+        """Check if the PDF has digital signatures worth preserving."""
+        if "/Perms" in doc.pdf.Root:
+            return True
+        acroform = doc.pdf.Root.get("/AcroForm")
+        if acroform and "/SigFlags" in acroform:
+            return True
+        return False
+
+    def _get_lib_dir(self) -> Path:
+        """Find the lib/ directory containing iText jars and XfaSave.class."""
+        # Check relative to this file
+        engine_dir = Path(__file__).parent
+        lib_dir = engine_dir.parent.parent / "lib"
+        if lib_dir.exists() and (lib_dir / "XfaSave.class").exists():
+            return lib_dir
+        # Check relative to package install
+        for candidate in [
+            engine_dir / "lib",
+            engine_dir.parent / "lib",
+            Path(os.environ.get("XFA_LIB_DIR", "")) if os.environ.get("XFA_LIB_DIR") else None,
+        ]:
+            if candidate and candidate.exists() and (candidate / "XfaSave.class").exists():
+                return candidate
+        return lib_dir  # fallback, may not exist
+
+    def _save_with_itext(self, doc: OpenDocument, output_path: Path) -> bool:
+        """Save using iText append mode to preserve digital signatures.
+
+        Only modifies the datasets stream (form data). Template and form
+        sections are left untouched to preserve the IRCC certification.
+
+        Note: Phone number fields that depend on JavaScript-driven visibility
+        (CanadaUS/Other toggle) will be filled but hidden. Users need to click
+        the corresponding checkbox in Adobe Reader to reveal them.
+
+        Returns True if successful, False if iText is not available.
+        """
+        lib_dir = self._get_lib_dir()
+        if not (lib_dir / "XfaSave.class").exists():
+            return False
+
+        try:
+            subprocess.run(["java", "-version"], capture_output=True, check=True)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return False
+
+        datasets_xml = etree.tostring(
+            doc.datasets_root, xml_declaration=False, encoding="unicode"
+        ).encode("utf-8")
+
+        tmp_xml_path = None
+        tmp_pdf_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp_xml:
+                tmp_xml.write(datasets_xml)
+                tmp_xml_path = tmp_xml.name
+
+            input_path = str(doc.source_path)
+            if doc.original_bytes:
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
+                    tmp_pdf.write(doc.original_bytes)
+                    tmp_pdf_path = tmp_pdf.name
+                input_path = tmp_pdf_path
+            elif not Path(input_path).exists():
+                return False
+
+            jars = list(lib_dir.glob("*.jar"))
+            cp = str(lib_dir) + ":" + ":".join(str(j) for j in jars)
+
+            result = subprocess.run(
+                ["java", "-cp", cp, "XfaSave",
+                 input_path, str(output_path), tmp_xml_path],
+                capture_output=True, text=True, timeout=30,
+            )
+
+            if result.returncode == 0:
+                for line in result.stdout.strip().split("\n"):
+                    if line.startswith("{"):
+                        resp = json.loads(line)
+                        return resp.get("status") == "ok"
+        except (subprocess.TimeoutExpired, json.JSONDecodeError):
+            pass
+        finally:
+            if tmp_xml_path and os.path.exists(tmp_xml_path):
+                os.unlink(tmp_xml_path)
+            if tmp_pdf_path and os.path.exists(tmp_pdf_path):
+                os.unlink(tmp_pdf_path)
+
+        return False
+
     def save(self, doc_id: str, output_path: Path) -> Path:
-        """Write modified datasets back to the PDF and save."""
+        """Write modified datasets back to the PDF and save.
+
+        Uses iText append mode if the PDF has digital signatures (preserves them).
+        Falls back to pikepdf if iText is not available.
+        """
         doc = self._get_doc(doc_id)
         output_path = Path(output_path)
 
-        self._prepare_for_save(doc)
+        if self._has_signatures(doc) and self._save_with_itext(doc, output_path):
+            return output_path
 
+        # Fallback: pikepdf (breaks signatures but always works)
+        self._prepare_for_save(doc)
         doc.pdf.save(output_path)
         return output_path
 
     def save_bytes(self, doc_id: str) -> bytes:
-        """Write modified datasets back to the PDF and return as bytes."""
+        """Write modified datasets back to the PDF and return as bytes.
+
+        Uses iText append mode if the PDF has digital signatures.
+        Falls back to pikepdf if iText is not available.
+        """
         doc = self._get_doc(doc_id)
 
-        self._prepare_for_save(doc)
+        if self._has_signatures(doc):
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            try:
+                if self._save_with_itext(doc, tmp_path):
+                    return tmp_path.read_bytes()
+            finally:
+                if tmp_path.exists():
+                    os.unlink(tmp_path)
 
+        # Fallback: pikepdf
+        self._prepare_for_save(doc)
         buf = io.BytesIO()
         doc.pdf.save(buf)
         return buf.getvalue()

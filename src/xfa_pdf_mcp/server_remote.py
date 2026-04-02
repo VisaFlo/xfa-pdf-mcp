@@ -322,9 +322,19 @@ def fill_fields(doc_id: str, field_values: dict[str, str]) -> dict:
     """
     results = engine.fill_fields(doc_id, field_values)
     filled_count = sum(1 for v in results.values() if v)
+
+    # Check if phone fields were filled — they need a user action to display
+    phone_filled = any("NANumber" in p or "IntlNumber" in p for p in field_values)
+    note = ""
+    if phone_filled:
+        note = (
+            " Note: Phone number fields are saved but may appear hidden in Adobe Reader. "
+            "Tell the user to click the Canada/US or Other checkbox once to reveal them."
+        )
+
     return {
         "results": results,
-        "message": f"Filled {filled_count}/{len(field_values)} fields.",
+        "message": f"Filled {filled_count}/{len(field_values)} fields.{note}",
     }
 
 
