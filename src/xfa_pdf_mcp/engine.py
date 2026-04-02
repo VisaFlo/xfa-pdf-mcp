@@ -1,5 +1,6 @@
 """Core XFA-PDF manipulation engine using pikepdf + lxml."""
 
+import re
 import uuid
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ class FieldMeta:
     field_type: str
     items: list[str]  # for checkButton: [on_value] or [on, off, neutral]
     options: list[tuple[str, str]] = field(default_factory=list)  # for choiceList: [(code, label), ...]
+    format_pattern: str = ""  # for dateTimeEdit/picture: the expected format pattern
 
 
 @dataclass
@@ -203,11 +205,27 @@ class XfaPdfEngine:
                     # LOV-driven — try to match field name to a LOV list
                     options = self._match_lov(name, lov_data)
 
+            # Extract format pattern for date/picture fields
+            format_pattern = ""
+            if field_type in ("dateTimeEdit", "picture"):
+                pics = field_elem.findall(f".//{{{ns_t}}}picture")
+                for pic in pics:
+                    if pic.text and "date{" in pic.text:
+                        format_pattern = "YYYY-MM-DD"
+                        break
+                    elif pic.text and "num{" in pic.text:
+                        format_pattern = pic.text
+                        break
+                    elif pic.text and "text{" in pic.text:
+                        format_pattern = pic.text
+                        break
+
             meta[full_path] = FieldMeta(
                 path=full_path,
                 field_type=field_type,
                 items=items,
                 options=options,
+                format_pattern=format_pattern,
             )
         return meta
 
@@ -241,11 +259,19 @@ class XfaPdfEngine:
             "abletocommunicate": "AbleCommunicateEnglishOrFrenchList",
             "workpermittype": "WorkPermitTypeList",
             "lov": "PreferenceLanguageList",
+            # Unresolved fields from form analysis
+            "servicein": "OfficialLanguageList",
+            "status": "ImmigrationStatusList",
+            "type": "PhoneTypeTRVList",
+            "purposeofvisit": "VisitPurposeList",
+            "program": "ApplyingProgramList",
+            "level": "LevelOfStudyList",
+            "expensespaidby": "ExpensesPaidBySPList",
         }
 
         # Province/State fields are cascade-dependent on country.
         # Merge all province/state LOV lists so any region can be resolved.
-        if fn in ("provincestate", "provstate"):
+        if fn in ("provincestate", "provstate", "prov"):
             combined = []
             seen_codes = set()
             for lov_name in ("ProvinceAbbrevList", "StateAbbrevList"):
@@ -293,6 +319,8 @@ class XfaPdfEngine:
                     entry["options_count"] = len(fm.options)
                     entry["options_sample"] = [{"code": c, "label": l} for c, l in fm.options[:10]]
                     entry["options_hint"] = "Use label or code. Call get_field_values for full list."
+            if fm.format_pattern:
+                entry["format"] = fm.format_pattern
             fields.append(entry)
 
         return fields
@@ -396,21 +424,61 @@ class XfaPdfEngine:
         # No match — return as-is (might be a valid code the LOV doesn't have)
         return value
 
+    def _normalize_date(self, doc: OpenDocument, path: str, value: str) -> str:
+        """Normalize date values to YYYY-MM-DD format for dateTimeEdit/picture fields.
+
+        Accepts: YYYY-MM-DD, MM/DD/YYYY, DD/MM/YYYY, YYYY/MM/DD, YYYYMMDD,
+                 Month DD YYYY, etc.
+        Returns: YYYY-MM-DD formatted string, or original value if not a date field.
+        """
+        fm = doc.field_meta.get(path)
+        if not fm or fm.format_pattern != "YYYY-MM-DD":
+            return value
+
+        # Already in correct format
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+            return value
+
+        # YYYYMMDD
+        if re.match(r"^\d{8}$", value):
+            return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
+
+        # YYYY/MM/DD
+        m = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", value)
+        if m:
+            return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
+
+        # MM/DD/YYYY or DD/MM/YYYY — assume MM/DD/YYYY (North American convention)
+        m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", value)
+        if m:
+            return f"{m.group(3)}-{m.group(1).zfill(2)}-{m.group(2).zfill(2)}"
+
+        # Month DD, YYYY (e.g. "January 15, 2025")
+        months = {
+            "january": "01", "february": "02", "march": "03", "april": "04",
+            "may": "05", "june": "06", "july": "07", "august": "08",
+            "september": "09", "october": "10", "november": "11", "december": "12",
+        }
+        m = re.match(r"^(\w+)\s+(\d{1,2}),?\s+(\d{4})$", value.strip())
+        if m and m.group(1).lower() in months:
+            return f"{m.group(3)}-{months[m.group(1).lower()]}-{m.group(2).zfill(2)}"
+
+        return value
+
     def fill_fields(self, doc_id: str, field_values: dict[str, str]) -> dict[str, bool]:
         """Fill multiple fields. Returns dict of path -> success.
 
-        For checkButton fields, accepts boolean-like values (true/false, yes/no,
-        checked/unchecked, on/off, 1/0) and auto-resolves to the correct template
-        item value.
-
-        For choiceList fields, accepts either the code or the display label and
-        auto-resolves to the correct code value.
+        Auto-resolves values based on field type:
+        - checkButton: true/false/yes/no -> correct template item value
+        - choiceList: display labels -> LOV code values
+        - dateTimeEdit/picture: various date formats -> YYYY-MM-DD
         """
         doc = self._get_doc(doc_id)
         results = {}
         for path, value in field_values.items():
             resolved = self._resolve_checkbox_value(doc, path, value)
             resolved = self._resolve_choicelist_value(doc, path, resolved)
+            resolved = self._normalize_date(doc, path, resolved)
             results[path] = self._set_value_at_path(doc, path, resolved)
         return results
 
