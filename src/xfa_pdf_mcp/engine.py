@@ -201,6 +201,15 @@ class XfaPdfEngine:
         ).encode("utf-8")
         doc.xfa_array[doc.datasets_index].write(modified_xml)
 
+        # Remove Reader Extensions and DocMDP signatures to avoid
+        # "certification is invalid" warnings in Adobe Reader.
+        # The form data is still correct without these signatures.
+        if "/Perms" in doc.pdf.Root:
+            del doc.pdf.Root["/Perms"]
+        acroform = doc.pdf.Root.get("/AcroForm")
+        if acroform and "/SigFlags" in acroform:
+            del acroform["/SigFlags"]
+
         doc.pdf.save(output_path)
         return output_path
 
