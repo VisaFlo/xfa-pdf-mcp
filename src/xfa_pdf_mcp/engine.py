@@ -137,6 +137,13 @@ class XfaPdfEngine:
                 label = item.text or ""
                 if code:  # skip empty entries
                     options.append((code, label))
+                # Handle nested LOVs (e.g. CityList has cities nested under provinces)
+                if len(list(item)) > 0:
+                    for nested in item:
+                        n_code = nested.get("lic", "")
+                        n_label = nested.text or ""
+                        if n_code:
+                            options.append((n_code, n_label))
             if options:
                 lov_data[list_name] = options
         return lov_data
@@ -232,10 +239,26 @@ class XfaPdfEngine:
             "typeofrelationship": "MaritalStatusHistoryList",
             "nativelang": "ContactLanguageList",
             "abletocommunicate": "AbleCommunicateEnglishOrFrenchList",
-            "provincestate": "ProvinceAbbrevList",
             "workpermittype": "WorkPermitTypeList",
             "lov": "PreferenceLanguageList",
         }
+
+        # Province/State fields are cascade-dependent on country.
+        # Merge all province/state LOV lists so any region can be resolved.
+        if fn in ("provincestate", "provstate"):
+            combined = []
+            seen_codes = set()
+            for lov_name in ("ProvinceAbbrevList", "StateAbbrevList"):
+                for code, label in lov_data.get(lov_name, []):
+                    if code not in seen_codes:
+                        combined.append((code, label))
+                        seen_codes.add(code)
+            return combined
+
+        # City fields are cascade-dependent on province.
+        # CityList is already flattened by _extract_lov (nested items merged).
+        if fn == "citytown" and "CityList" in lov_data:
+            return lov_data["CityList"]
 
         mapped_lov = mappings.get(fn)
         if mapped_lov and mapped_lov in lov_data:
