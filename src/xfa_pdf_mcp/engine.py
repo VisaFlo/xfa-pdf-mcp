@@ -191,6 +191,16 @@ class XfaPdfEngine:
             results[path] = self._set_value_at_path(doc, path, value)
         return results
 
+    def _strip_signature_fields(self, fields) -> None:
+        """Recursively remove /V from signature fields."""
+        for field in fields:
+            ft = str(field.get("/FT", ""))
+            if ft == "/Sig" and "/V" in field:
+                del field["/V"]
+            kids = field.get("/Kids", [])
+            if kids:
+                self._strip_signature_fields(kids)
+
     def save(self, doc_id: str, output_path: Path) -> Path:
         """Write modified datasets back to the PDF and save."""
         doc = self._get_doc(doc_id)
@@ -201,14 +211,18 @@ class XfaPdfEngine:
         ).encode("utf-8")
         doc.xfa_array[doc.datasets_index].write(modified_xml)
 
-        # Remove Reader Extensions and DocMDP signatures to avoid
+        # Remove all certification/signature data to avoid
         # "certification is invalid" warnings in Adobe Reader.
-        # The form data is still correct without these signatures.
         if "/Perms" in doc.pdf.Root:
             del doc.pdf.Root["/Perms"]
+        if "/DSS" in doc.pdf.Root:
+            del doc.pdf.Root["/DSS"]
         acroform = doc.pdf.Root.get("/AcroForm")
-        if acroform and "/SigFlags" in acroform:
-            del acroform["/SigFlags"]
+        if acroform:
+            if "/SigFlags" in acroform:
+                del acroform["/SigFlags"]
+            # Remove signature field values from form fields
+            self._strip_signature_fields(acroform.get("/Fields", []))
 
         doc.pdf.save(output_path)
         return output_path
