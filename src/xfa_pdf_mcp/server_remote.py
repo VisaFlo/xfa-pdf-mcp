@@ -26,8 +26,10 @@ mcp = FastMCP(
         "This server fills XFA-PDF form fields (e.g. IRCC immigration forms). "
         "Workflow: upload_pdf -> list_fields -> fill_fields -> download_pdf -> close_pdf. "
         "Fields are addressed by their XFA path (e.g. form1/Page1/PersonalDetails/Name/FamilyName). "
-        "Upload PDFs via URL (preferred for large files) or base64. "
-        "Download filled PDFs as base64 (small files) or chunked."
+        "Upload PDFs via URL or have the user upload at the /upload web page. "
+        "IMPORTANT: Do NOT try to send PDF file contents as base64. Instead, either: "
+        "(1) ask the user to upload their PDF at the upload page and give you the doc_id, or "
+        "(2) use pdf_url if you have a direct download link to the PDF file."
     ),
 )
 
@@ -36,6 +38,145 @@ engine = XfaPdfEngine()
 # Store filled PDF bytes keyed by doc_id for download
 _filled_cache: dict[str, tuple[bytes, str, float]] = {}  # doc_id -> (bytes, filename, timestamp)
 _CACHE_TTL = 1800  # 30 minutes
+
+
+# ---- Custom HTTP routes for file upload/download (non-MCP) ----
+
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, Response
+
+
+@mcp.custom_route("/upload", methods=["GET"])
+async def upload_page(request: Request) -> HTMLResponse:
+    """Serve a simple upload page where users can drop their PDF."""
+    html = """<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XFA-PDF Upload</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f5f5f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+  .container { background: white; border-radius: 12px; padding: 40px; max-width: 500px; width: 90%; box-shadow: 0 2px 12px rgba(0,0,0,0.1); }
+  h1 { font-size: 1.5rem; margin-bottom: 8px; }
+  p { color: #666; margin-bottom: 24px; font-size: 0.9rem; }
+  .dropzone { border: 2px dashed #ccc; border-radius: 8px; padding: 40px 20px; text-align: center; cursor: pointer; transition: all 0.2s; }
+  .dropzone:hover, .dropzone.dragover { border-color: #2563eb; background: #eff6ff; }
+  .dropzone input { display: none; }
+  .result { margin-top: 20px; padding: 16px; border-radius: 8px; display: none; }
+  .result.success { background: #f0fdf4; border: 1px solid #86efac; display: block; }
+  .result.error { background: #fef2f2; border: 1px solid #fca5a5; display: block; }
+  .doc-id { font-family: monospace; font-size: 1.2rem; font-weight: bold; color: #2563eb; user-select: all; }
+  .loading { display: none; margin-top: 20px; text-align: center; color: #666; }
+  .copy-btn { margin-top: 8px; padding: 6px 16px; background: #2563eb; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
+  .copy-btn:hover { background: #1d4ed8; }
+</style>
+</head><body>
+<div class="container">
+  <h1>Upload XFA-PDF Form</h1>
+  <p>Upload your IRCC immigration form (IMM series) to get a document ID for use with ChatGPT, Claude, or any AI assistant.</p>
+  <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+    <input type="file" id="fileInput" accept=".pdf">
+    <p style="margin:0;color:#888;">Drop your PDF here or click to browse</p>
+  </div>
+  <div class="loading" id="loading">Uploading and parsing form...</div>
+  <div class="result" id="result"></div>
+</div>
+<script>
+const dz = document.getElementById('dropzone');
+const fi = document.getElementById('fileInput');
+const loading = document.getElementById('loading');
+const result = document.getElementById('result');
+
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
+dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('dragover'); handleFile(e.dataTransfer.files[0]); });
+fi.addEventListener('change', () => { if (fi.files[0]) handleFile(fi.files[0]); });
+
+async function handleFile(file) {
+  if (!file.name.toLowerCase().endsWith('.pdf')) { showError('Please upload a PDF file.'); return; }
+  loading.style.display = 'block';
+  result.className = 'result';
+  result.style.display = 'none';
+  const formData = new FormData();
+  formData.append('file', file);
+  try {
+    const resp = await fetch('/upload-file', { method: 'POST', body: formData });
+    const data = await resp.json();
+    if (data.error) { showError(data.error); return; }
+    result.className = 'result success';
+    result.innerHTML = '<p>Your document ID:</p><p class="doc-id">' + data.doc_id + '</p>' +
+      '<p style="margin-top:8px;color:#666;font-size:0.85rem;">' + data.field_count + ' fields found in ' + data.filename + '</p>' +
+      '<button class="copy-btn" onclick="navigator.clipboard.writeText(\\'' + data.doc_id + '\\')">Copy doc_id</button>' +
+      '<p style="margin-top:12px;color:#666;font-size:0.85rem;">Give this doc_id to your AI assistant to fill the form.</p>';
+    result.style.display = 'block';
+  } catch (e) { showError('Upload failed: ' + e.message); }
+  loading.style.display = 'none';
+}
+
+function showError(msg) {
+  result.className = 'result error';
+  result.innerHTML = '<p style="color:#dc2626;">' + msg + '</p>';
+  result.style.display = 'block';
+  loading.style.display = 'none';
+}
+</script>
+</body></html>"""
+    return HTMLResponse(html)
+
+
+@mcp.custom_route("/upload-file", methods=["POST"])
+async def upload_file_endpoint(request: Request) -> JSONResponse:
+    """Accept multipart file upload, return doc_id."""
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type:
+        return JSONResponse({"error": "Expected multipart/form-data"}, status_code=400)
+
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        return JSONResponse({"error": "No file uploaded"}, status_code=400)
+
+    pdf_bytes = await file.read()
+    filename = getattr(file, "filename", "form.pdf") or "form.pdf"
+
+    try:
+        doc_id = engine.open_bytes(pdf_bytes, filename)
+        fields = engine.list_fields(doc_id)
+        return JSONResponse({
+            "doc_id": doc_id,
+            "filename": filename,
+            "field_count": len(fields),
+        })
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@mcp.custom_route("/download-file/{doc_id}", methods=["GET"])
+async def download_file_endpoint(request: Request) -> Response:
+    """Download a filled PDF by doc_id."""
+    doc_id = request.path_params["doc_id"]
+
+    # Check cache first (from download_pdf tool)
+    if doc_id in _filled_cache:
+        pdf_bytes, filename, _ = _filled_cache[doc_id]
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # Fall back to generating on the fly
+    try:
+        doc = engine._get_doc(doc_id)
+        pdf_bytes = engine.save_bytes(doc_id)
+        filename = f"filled_{doc.source_path.name}"
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except ValueError:
+        return JSONResponse({"error": f"Document {doc_id} not found"}, status_code=404)
 
 
 def _cleanup_cache():
@@ -48,23 +189,39 @@ def _cleanup_cache():
 
 @mcp.tool()
 def upload_pdf(
+    doc_id: str = "",
     pdf_url: str = "",
     pdf_base64: str = "",
     filename: str = "form.pdf",
 ) -> dict:
-    """Upload an XFA-PDF form and get a document ID.
+    """Open an XFA-PDF form for filling. Three ways to provide the PDF:
 
-    Provide EITHER a URL to download the PDF from OR base64-encoded bytes.
-    URL is preferred for large files (avoids payload size limits).
+    1. doc_id: If the user already uploaded via the web page, just pass the doc_id they received.
+    2. pdf_url: A direct HTTP/HTTPS link to the PDF file. The server downloads it.
+    3. pdf_base64: Base64-encoded PDF bytes (only for very small files).
+
+    IMPORTANT: Do NOT try to encode a PDF file as base64 yourself — it will be truncated.
+    Instead, ask the user to upload at the web upload page and give you the doc_id.
 
     Args:
-        pdf_url: URL to download the PDF from (preferred). Supports http/https.
-        pdf_base64: Base64-encoded PDF bytes (alternative for small files).
+        doc_id: Document ID from a previous web upload (if already uploaded).
+        pdf_url: Direct URL to download the PDF from.
+        pdf_base64: Base64-encoded PDF bytes (small files only).
         filename: Original filename (for reference).
 
     Returns:
         Document ID, form name, and field count.
     """
+    if doc_id:
+        # User already uploaded via web page — just verify it exists
+        doc = engine._get_doc(doc_id)
+        fields = engine.list_fields(doc_id)
+        return {
+            "doc_id": doc_id,
+            "file": str(doc.source_path.name),
+            "field_count": len(fields),
+            "message": f"Document {doc_id} is ready with {len(fields)} fields.",
+        }
     if pdf_url:
         parsed = urlparse(pdf_url)
         if parsed.scheme not in ("http", "https"):
@@ -147,23 +304,30 @@ def fill_fields(doc_id: str, field_values: dict[str, str]) -> dict:
 
 @mcp.tool()
 def download_pdf(doc_id: str) -> dict:
-    """Get the filled PDF as base64.
+    """Save the filled PDF and get a download link.
+
+    The user can download the filled PDF from the returned URL.
+    Give the download_url to the user so they can download their filled form.
 
     Args:
         doc_id: Document ID from upload_pdf.
 
     Returns:
-        Base64-encoded PDF bytes, filename, and size.
+        Download URL, filename, and size.
     """
     _cleanup_cache()
     doc = engine._get_doc(doc_id)
     pdf_bytes = engine.save_bytes(doc_id)
     filename = f"filled_{doc.source_path.name}"
 
+    # Cache for download via HTTP endpoint
+    _filled_cache[doc_id] = (pdf_bytes, filename, time.time())
+
     return {
-        "pdf_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+        "download_url": f"/download-file/{doc_id}",
         "filename": filename,
         "size_bytes": len(pdf_bytes),
+        "message": f"PDF ready for download ({len(pdf_bytes)} bytes). Give the user this download link.",
     }
 
 
