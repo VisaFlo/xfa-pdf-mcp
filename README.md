@@ -6,7 +6,16 @@ Tested against **95+ IRCC immigration forms** with 100% roundtrip success.
 
 ## Quick Start (Hosted)
 
-No installation required. Connect to the hosted server with a single config line.
+No installation required. Connect to the hosted MCP server with one step.
+
+### ChatGPT
+
+1. Go to **Settings** > **Developer Mode** (enable if needed)
+2. Go to **Connectors** > **Add MCP Server**
+3. Enter URL: `https://xfa-pdf-mcp.vflo.app/mcp`
+4. Name it "XFA PDF Filler" and save
+
+Then ask ChatGPT: *"Upload imm5257e.pdf and fill in FamilyName=KIM, GivenName=YULBIN"*
 
 ### Claude Code
 
@@ -27,6 +36,13 @@ Add to `claude_desktop_config.json`:
     }
   }
 }
+```
+
+### OpenAI Agents SDK / Responses API
+
+```python
+# Connect as an MCP tool source
+tool = {"type": "mcp", "server_url": "https://xfa-pdf-mcp.vflo.app/mcp"}
 ```
 
 ## Self-Hosted Setup
@@ -227,8 +243,9 @@ Verified with 95+ IRCC immigration forms including:
     |  server.py         |        |  server_remote.py     |
     +--------------------+        +-----------------------+
               |                               |
-    Claude Code/Desktop           Claude Desktop/Code
-    (local install)               (hosted — no install)
+    Claude Code/Desktop           ChatGPT, Claude Desktop,
+    (local install)               Claude Code, OpenAI Agents
+                                  (hosted — no install)
 ```
 
 ## Deployment
