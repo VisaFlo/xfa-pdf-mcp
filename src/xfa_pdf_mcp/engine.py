@@ -18,6 +18,14 @@ TEMPLATE_NS_PREFIXES = [
 
 
 @dataclass
+class FieldMeta:
+    """Metadata for a single form field, extracted from the template."""
+    path: str
+    field_type: str
+    items: list[str]  # for checkButton: [on_value] or [on, off, neutral]; for choiceList: option values
+
+
+@dataclass
 class OpenDocument:
     """Represents an open XFA-PDF in memory."""
     pdf: pikepdf.Pdf
@@ -28,6 +36,7 @@ class OpenDocument:
     data_node: Any
     template_ns: str
     template_root: Any
+    field_meta: dict[str, FieldMeta] = field(default_factory=dict)
 
 
 class XfaPdfEngine:
@@ -87,30 +96,26 @@ class XfaPdfEngine:
             raise ValueError("No XFA: xfa:data node not found in datasets")
 
         doc_id = str(uuid.uuid4())[:8]
-        self.documents[doc_id] = OpenDocument(
+        detected_ns = template_ns or TEMPLATE_NS_PREFIXES[0]
+        doc = OpenDocument(
             pdf=pdf,
             source_path=path,
             xfa_array=xfa,
             datasets_index=datasets_index,
             datasets_root=datasets_root,
             data_node=data_node,
-            template_ns=template_ns or TEMPLATE_NS_PREFIXES[0],
+            template_ns=detected_ns,
             template_root=template_root,
         )
+        # Build field metadata cache from template
+        doc.field_meta = self._build_field_meta(template_root, detected_ns)
+        self.documents[doc_id] = doc
         return doc_id
 
-    def _get_doc(self, doc_id: str) -> OpenDocument:
-        if doc_id not in self.documents:
-            raise ValueError(f"Document {doc_id} not found. Open it first.")
-        return self.documents[doc_id]
-
-    def list_fields(self, doc_id: str) -> list[dict[str, str]]:
-        """List all fillable fields with their XFA paths and types."""
-        doc = self._get_doc(doc_id)
-        ns_t = doc.template_ns
-        fields = []
-
-        for field_elem in doc.template_root.iter(f"{{{ns_t}}}field"):
+    def _build_field_meta(self, template_root, ns_t: str) -> dict[str, FieldMeta]:
+        """Extract field metadata (type, items/options) from the XFA template."""
+        meta = {}
+        for field_elem in template_root.iter(f"{{{ns_t}}}field"):
             name = field_elem.get("name")
             if not name:
                 continue
@@ -131,13 +136,40 @@ class XfaPdfEngine:
                     field_type = etree.QName(child.tag).localname
                     break
 
-            current_value = self._get_value_at_path(doc, full_path)
+            # Extract items (checkbox on/off values, choiceList options)
+            items = []
+            for items_elem in field_elem.findall(f"{{{ns_t}}}items"):
+                for item in items_elem:
+                    if item.text:
+                        items.append(item.text)
 
-            fields.append({
-                "path": full_path,
-                "type": field_type,
+            meta[full_path] = FieldMeta(
+                path=full_path,
+                field_type=field_type,
+                items=items,
+            )
+        return meta
+
+    def _get_doc(self, doc_id: str) -> OpenDocument:
+        if doc_id not in self.documents:
+            raise ValueError(f"Document {doc_id} not found. Open it first.")
+        return self.documents[doc_id]
+
+    def list_fields(self, doc_id: str) -> list[dict]:
+        """List all fillable fields with their XFA paths, types, and valid values."""
+        doc = self._get_doc(doc_id)
+        fields = []
+
+        for path, fm in doc.field_meta.items():
+            current_value = self._get_value_at_path(doc, path)
+            entry = {
+                "path": path,
+                "type": fm.field_type,
                 "value": current_value or "",
-            })
+            }
+            if fm.items:
+                entry["items"] = fm.items
+            fields.append(entry)
 
         return fields
 
@@ -183,12 +215,45 @@ class XfaPdfEngine:
             result[path] = self._get_value_at_path(doc, path)
         return result
 
+    def _resolve_checkbox_value(self, doc: OpenDocument, path: str, value: str) -> str:
+        """Resolve a checkbox value to the correct template item value.
+
+        Accepts: true/false/checked/unchecked/on/off/yes/no/1/0
+        Returns: the actual item value from the template (e.g. "Y", "N", "1", "0")
+        """
+        fm = doc.field_meta.get(path)
+        if not fm or fm.field_type != "checkButton" or not fm.items:
+            return value
+
+        # Normalize input
+        v = value.strip().lower()
+        is_on = v in ("true", "checked", "on", "yes", "1", "y")
+        is_off = v in ("false", "unchecked", "off", "no", "0", "n")
+
+        if not is_on and not is_off:
+            # Not a boolean-like value — pass through as-is (might be the actual item value)
+            return value
+
+        # items layout: [on_value] or [on_value, off_value] or [on, off, neutral]
+        if is_on:
+            return fm.items[0]  # first item is always the "on" value
+        else:
+            if len(fm.items) >= 2:
+                return fm.items[1]  # second item is "off"
+            return ""  # no off value defined — clear it
+
     def fill_fields(self, doc_id: str, field_values: dict[str, str]) -> dict[str, bool]:
-        """Fill multiple fields. Returns dict of path -> success."""
+        """Fill multiple fields. Returns dict of path -> success.
+
+        For checkButton fields, accepts boolean-like values (true/false, yes/no,
+        checked/unchecked, on/off, 1/0) and auto-resolves to the correct template
+        item value.
+        """
         doc = self._get_doc(doc_id)
         results = {}
         for path, value in field_values.items():
-            results[path] = self._set_value_at_path(doc, path, value)
+            resolved = self._resolve_checkbox_value(doc, path, value)
+            results[path] = self._set_value_at_path(doc, path, resolved)
         return results
 
     def _strip_signature_fields(self, fields) -> None:
