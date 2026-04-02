@@ -72,7 +72,15 @@ def upload_pdf(
         try:
             resp = httpx.get(pdf_url, follow_redirects=True, timeout=30)
             resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            if "html" in content_type:
+                raise ValueError(
+                    f"URL returned HTML, not a PDF. The URL may have redirected to a web page. "
+                    f"Make sure the URL points directly to a .pdf file."
+                )
             pdf_bytes = resp.content
+            if not pdf_bytes[:5] == b"%PDF-":
+                raise ValueError("Downloaded content is not a valid PDF file.")
         except httpx.HTTPError as e:
             raise ValueError(f"Failed to download PDF from URL: {e}")
         if not filename or filename == "form.pdf":
