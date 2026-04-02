@@ -26,10 +26,9 @@ mcp = FastMCP(
         "This server fills XFA-PDF form fields (e.g. IRCC immigration forms). "
         "Workflow: upload_pdf -> list_fields -> fill_fields -> download_pdf -> close_pdf. "
         "Fields are addressed by their XFA path (e.g. form1/Page1/PersonalDetails/Name/FamilyName). "
-        "Upload PDFs via URL or have the user upload at the /upload web page. "
-        "IMPORTANT: Do NOT try to send PDF file contents as base64. Instead, either: "
-        "(1) ask the user to upload their PDF at the upload page and give you the doc_id, or "
-        "(2) use pdf_url if you have a direct download link to the PDF file."
+        "When the user attaches a PDF file, pass it to upload_pdf using the file parameter "
+        "(for ChatGPT file references) or pdf_url (for direct links). "
+        "The download_pdf tool returns a download URL for the user to get their filled form."
     ),
 )
 
@@ -192,28 +191,26 @@ def upload_pdf(
     doc_id: str = "",
     pdf_url: str = "",
     pdf_base64: str = "",
+    file: str = "",
     filename: str = "form.pdf",
 ) -> dict:
-    """Open an XFA-PDF form for filling. Three ways to provide the PDF:
+    """Open an XFA-PDF form for filling.
 
-    1. doc_id: If the user already uploaded via the web page, just pass the doc_id they received.
-    2. pdf_url: A direct HTTP/HTTPS link to the PDF file. The server downloads it.
-    3. pdf_base64: Base64-encoded PDF bytes (only for very small files).
-
-    IMPORTANT: Do NOT try to encode a PDF file as base64 yourself — it will be truncated.
-    Instead, ask the user to upload at the web upload page and give you the doc_id.
+    When the user drops/attaches a PDF file in the chat, pass it using the file
+    parameter or pdf_url. The server will download and parse it.
 
     Args:
-        doc_id: Document ID from a previous web upload (if already uploaded).
-        pdf_url: Direct URL to download the PDF from.
-        pdf_base64: Base64-encoded PDF bytes (small files only).
-        filename: Original filename (for reference).
+        doc_id: Document ID if the PDF was already uploaded (reuse existing).
+        pdf_url: Direct HTTP/HTTPS URL to the PDF file.
+        pdf_base64: Base64-encoded PDF bytes.
+        file: File reference (URL or JSON object with download_url from ChatGPT).
+        filename: Original filename for reference.
 
     Returns:
         Document ID, form name, and field count.
     """
+    # If doc_id provided, just verify it exists
     if doc_id:
-        # User already uploaded via web page — just verify it exists
         doc = engine._get_doc(doc_id)
         fields = engine.list_fields(doc_id)
         return {
@@ -222,33 +219,62 @@ def upload_pdf(
             "field_count": len(fields),
             "message": f"Document {doc_id} is ready with {len(fields)} fields.",
         }
+
+    # Resolve the PDF bytes from whichever source is provided
+    pdf_bytes = None
+
+    # Handle ChatGPT file reference (JSON object with download_url)
+    if file:
+        url = None
+        if isinstance(file, dict):
+            url = file.get("download_url") or file.get("url")
+        elif isinstance(file, str):
+            # Could be a URL string or a JSON string
+            if file.startswith("http"):
+                url = file
+            elif file.startswith("{"):
+                import json as _json
+                try:
+                    obj = _json.loads(file)
+                    url = obj.get("download_url") or obj.get("url")
+                except _json.JSONDecodeError:
+                    pass
+            if not url:
+                url = file  # treat as URL
+        if url:
+            pdf_url = url
+
     if pdf_url:
         parsed = urlparse(pdf_url)
         if parsed.scheme not in ("http", "https"):
             raise ValueError(f"Invalid URL scheme: {parsed.scheme}. Use http or https.")
         try:
-            resp = httpx.get(pdf_url, follow_redirects=True, timeout=30)
+            resp = httpx.get(pdf_url, follow_redirects=True, timeout=60)
             resp.raise_for_status()
             content_type = resp.headers.get("content-type", "")
             if "html" in content_type:
                 raise ValueError(
-                    f"URL returned HTML, not a PDF. The URL may have redirected to a web page. "
-                    f"Make sure the URL points directly to a .pdf file."
+                    "URL returned HTML, not a PDF. "
+                    "Make sure the URL points directly to a .pdf file."
                 )
             pdf_bytes = resp.content
-            if not pdf_bytes[:5] == b"%PDF-":
+            if len(pdf_bytes) < 100 or pdf_bytes[:5] != b"%PDF-":
                 raise ValueError("Downloaded content is not a valid PDF file.")
         except httpx.HTTPError as e:
             raise ValueError(f"Failed to download PDF from URL: {e}")
         if not filename or filename == "form.pdf":
             filename = Path(parsed.path).name or "form.pdf"
+
     elif pdf_base64:
         try:
             pdf_bytes = base64.b64decode(pdf_base64)
         except Exception:
             raise ValueError("Invalid base64 encoding")
-    else:
-        raise ValueError("Provide either pdf_url or pdf_base64")
+
+    if pdf_bytes is None:
+        raise ValueError(
+            "No PDF provided. Attach the PDF file in the chat, or provide a pdf_url."
+        )
 
     doc_id = engine.open_bytes(pdf_bytes, filename)
     fields = engine.list_fields(doc_id)
