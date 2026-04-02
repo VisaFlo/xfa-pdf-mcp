@@ -662,7 +662,45 @@ class XfaPdfEngine:
                         self._set_value_at_path(doc, parent_path + "/NANumber/FirstThree", "")
                         self._set_value_at_path(doc, parent_path + "/NANumber/LastFive", "")
 
+        # Post-processing: compute ActualNumber for phone fields
+        # Adobe's JS computes this from parts; we must do it manually
+        self._sync_phone_actual_numbers(doc, field_values)
+
         return results
+
+    def _sync_phone_actual_numbers(self, doc: "OpenDocument", field_values: dict[str, str]) -> None:
+        """Compute ActualNumber from phone number parts after filling.
+
+        Adobe JS concatenates AreaCode+FirstThree+LastFive (for Canada/US)
+        or CountryCode+IntlNumber (for International) into ActualNumber.
+        """
+        # Find all phone parent paths that were touched
+        phone_parents = set()
+        for path in field_values:
+            parts = path.split("/")
+            for i, part in enumerate(parts):
+                if part in ("Phone", "AltPhone"):
+                    phone_parents.add("/".join(parts[:i + 1]))
+                    break
+
+        for parent in phone_parents:
+            canada_us = self._get_value_at_path(doc, parent + "/CanadaUS")
+            if canada_us == "1":
+                # Canada/US: ActualNumber = AreaCode + FirstThree + LastFive
+                area = self._get_value_at_path(doc, parent + "/NANumber/AreaCode") or ""
+                first = self._get_value_at_path(doc, parent + "/NANumber/FirstThree") or ""
+                last = self._get_value_at_path(doc, parent + "/NANumber/LastFive") or ""
+                actual = area + first + last
+                if actual:
+                    self._set_value_at_path(doc, parent + "/ActualNumber", actual)
+                    self._set_value_at_path(doc, parent + "/NumberCountry", "1")
+            else:
+                # International: ActualNumber = IntlNumber (with country code prefix)
+                country = self._get_value_at_path(doc, parent + "/NumberCountry") or ""
+                intl = self._get_value_at_path(doc, parent + "/IntlNumber/IntlNumber") or ""
+                if intl:
+                    actual = f"+{country}{intl}" if country else intl
+                    self._set_value_at_path(doc, parent + "/ActualNumber", actual)
 
     def list_repeating_sections(self, doc_id: str) -> list[dict]:
         """List all repeating sections (dynamic rows) in the form."""
