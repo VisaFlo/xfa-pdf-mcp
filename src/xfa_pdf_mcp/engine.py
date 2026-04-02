@@ -197,8 +197,8 @@ class XfaPdfEngine:
         output_path = Path(output_path)
 
         modified_xml = etree.tostring(
-            doc.datasets_root, xml_declaration=True, encoding="UTF-8"
-        )
+            doc.datasets_root, xml_declaration=False, encoding="unicode"
+        ).encode("utf-8")
         doc.xfa_array[doc.datasets_index].write(modified_xml)
 
         doc.pdf.save(output_path)
