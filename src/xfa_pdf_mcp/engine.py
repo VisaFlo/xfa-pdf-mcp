@@ -259,19 +259,44 @@ class XfaPdfEngine:
             "abletocommunicate": "AbleCommunicateEnglishOrFrenchList",
             "workpermittype": "WorkPermitTypeList",
             "lov": "PreferenceLanguageList",
-            # Unresolved fields from form analysis
+            # Fields discovered from testing 95+ IMM forms
             "servicein": "OfficialLanguageList",
             "status": "ImmigrationStatusList",
+            "statusincan": "SponsorStatusInCanadaList",
             "type": "PhoneTypeTRVList",
             "purposeofvisit": "VisitPurposeList",
+            "purpose": "VisitPurposeList",
             "program": "ApplyingProgramList",
             "level": "LevelOfStudyList",
+            "leveledu": "EducationLevelList",
             "expensespaidby": "ExpensesPaidBySPList",
+            "exppaidby": "ExpensesPaidBySPList",
+            "relationship": "RelationshipToPAList",
+            "rel2sponsor": "RelationshipToSponsorList",
+            "relationshiptoapplicant": "RelationshipToPAList",
+            "maritalstatusnew": "MaritalStatusList",
+            "langpref": "PreferenceLanguageList",
+            "communicatelang": "AbleCommunicateEnglishOrFrenchList",
+            "communicationlang": "AbleCommunicateEnglishOrFrenchList",
+            "freqlang": "ContactLanguageList",
+            "correspondencelang": "OfficialLanguageList",
+            "interviewlang": "InterviewLanguageList",
+            "citizenship1": "CountryOfCitizenshipList",
+            "citizenship2": "CountryOfCitizenshipList",
+            "citizencountry": "CountryOfCitizenshipList",
+            "countryterritory": "CountryList",
+            "countrywithcanada": "CountryList",
+            "countrywithoutcanada": "CountryList",
+            "gender": "GenderMelList",
+            "eyecolour": "EyeColorList",
+            "typeofdepchildren": "DependantTypeList",
+            "category": "ApplyingCategoryList",
+            "permittype": "WorkPermitTypeInLandList",
         }
 
         # Province/State fields are cascade-dependent on country.
         # Merge all province/state LOV lists so any region can be resolved.
-        if fn in ("provincestate", "provstate", "prov"):
+        if fn in ("provincestate", "provstate", "prov", "currentprovince"):
             combined = []
             seen_codes = set()
             for lov_name in ("ProvinceAbbrevList", "StateAbbrevList"):
