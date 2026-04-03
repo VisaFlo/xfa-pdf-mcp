@@ -865,51 +865,6 @@ class XfaPdfEngine:
                 elif child_name == "IntlNumber":
                     child_sf.set("presence", "invisible" if canada_us == "1" else "visible")
 
-    def _sync_form_presence(self, doc: OpenDocument) -> None:
-        """Update the XFA form section's presence attributes based on data values.
-
-        The form section stores runtime state (like JS-driven visibility changes).
-        Modifying it is allowed under DocMDP /P:2 and preserves signatures.
-        """
-        if doc.form_root is None:
-            return
-
-        # Detect the form namespace
-        form_ns = ""
-        if "}" in doc.form_root.tag:
-            form_ns = doc.form_root.tag.split("}")[0].lstrip("{")
-
-        ns_prefix = f"{{{form_ns}}}" if form_ns else ""
-
-        for subform in doc.form_root.iter(f"{ns_prefix}subform"):
-            sf_name = subform.get("name", "")
-            if sf_name not in ("Phone", "AltPhone"):
-                continue
-
-            # Build data path
-            path_parts = []
-            parent = subform.getparent()
-            while parent is not None:
-                pname = parent.get("name", "")
-                if pname:
-                    path_parts.insert(0, pname)
-                parent = parent.getparent()
-            data_path = "/".join(path_parts) + "/" + sf_name
-
-            canada_us = self._get_value_at_path(doc, data_path + "/CanadaUS")
-
-            for child_sf in subform:
-                if not isinstance(child_sf.tag, str):
-                    continue
-                child_tag = etree.QName(child_sf.tag).localname if "}" in child_sf.tag else child_sf.tag
-                if child_tag != "subform":
-                    continue
-                child_name = child_sf.get("name", "")
-                if child_name == "NANumber":
-                    child_sf.set("presence", "visible" if canada_us == "1" else "invisible")
-                elif child_name == "IntlNumber":
-                    child_sf.set("presence", "invisible" if canada_us == "1" else "visible")
-
     def _prepare_for_save(self, doc: OpenDocument) -> None:
         """Serialize modified datasets XML back into the PDF and strip signatures.
 

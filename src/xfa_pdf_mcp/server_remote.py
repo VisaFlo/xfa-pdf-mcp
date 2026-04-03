@@ -324,12 +324,17 @@ def fill_fields(doc_id: str, field_values: dict[str, str]) -> dict:
     filled_count = sum(1 for v in results.values() if v)
 
     # Check if phone fields were filled — they need a user action to display
-    phone_filled = any("NANumber" in p or "IntlNumber" in p for p in field_values)
+    phone_filled = any(
+        "NANumber" in p or "IntlNumber" in p or "AreaCode" in p or
+        "FirstThree" in p or "LastFive" in p
+        for p in field_values
+    )
     note = ""
     if phone_filled:
         note = (
-            " Note: Phone number fields are saved but may appear hidden in Adobe Reader. "
-            "Tell the user to click the Canada/US or Other checkbox once to reveal them."
+            " IMPORTANT: Phone number data is saved but appears hidden until activated. "
+            "Tell the user: 'After opening in Adobe Reader, click the Canada/US (or Other) "
+            "checkbox in the phone section to reveal the pre-filled phone number.'"
         )
 
     return {
