@@ -14,6 +14,7 @@ from xfa_pdf_mcp.engine import XfaPdfEngine
 
 _host = os.environ.get("HOST", "0.0.0.0")
 _port = int(os.environ.get("PORT", "8080"))
+_base_url = os.environ.get("BASE_URL", "https://xfa-pdf-mcp.vflo.app")
 
 # Temporary directory for storing filled PDFs for download
 _tmp_dir = Path(tempfile.mkdtemp(prefix="xfa-pdf-mcp-"))
@@ -364,11 +365,13 @@ def download_pdf(doc_id: str) -> dict:
     # Cache for download via HTTP endpoint
     _filled_cache[doc_id] = (pdf_bytes, filename, time.time())
 
+    download_url = f"{_base_url}/download-file/{doc_id}"
+
     return {
-        "download_url": f"/download-file/{doc_id}",
+        "download_url": download_url,
         "filename": filename,
         "size_bytes": len(pdf_bytes),
-        "message": f"PDF ready for download ({len(pdf_bytes)} bytes). Give the user this download link.",
+        "message": f"PDF ready. Give this link to the user to download: {download_url}",
     }
 
 
